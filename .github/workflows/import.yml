@@ -13,6 +13,13 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
+      - name: Show files
+        run: |
+          pwd
+          ls -la
+          echo "----- import.py head -----"
+          head -40 import.py
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
