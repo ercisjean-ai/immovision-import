@@ -6,6 +6,8 @@ import requests
 from bs4 import BeautifulSoup
 from supabase import create_client
 
+print("### V3 DEBUG SCRIPT LOADED ###")
+
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_ANON_KEY"]
 
@@ -244,28 +246,11 @@ def build_analysis(item: dict) -> dict:
         monthly_spread = None
         price_per_unit = round(price / units, 2) if price and units else None
 
-    if source_listing_id == "21408502":
-        compatible = False
-        reason = "3 unités annoncées. Prix/unité au-dessus du seuil de 170k."
-        score = 42
-    elif source_listing_id == "21423814":
-        compatible = False
-        reason = "Non compatible : situation urbanistique contraire à la stratégie déjà divisée."
-        score = 18
-    elif source_listing_id == "21422401":
-        compatible = False
-        reason = "À vérifier : potentiel de division mentionné, unités existantes non confirmées."
-        score = 30
-    else:
-        compatible = False
-        reason = item.get("notes") or "À valider"
-        score = None
-
     return {
         "listing_id": listing_id,
         "zone_label": "Zone prioritaire",
-        "strategy_compatible": compatible,
-        "compatibility_reason": reason,
+        "strategy_compatible": False,
+        "compatibility_reason": item.get("notes") or "À valider",
         "price_per_unit": price_per_unit,
         "estimated_rent_per_unit": rent_per_unit,
         "estimated_total_rent_monthly": total_monthly_rent,
@@ -274,7 +259,7 @@ def build_analysis(item: dict) -> dict:
         "estimated_gross_yield": gross_yield,
         "estimated_monthly_spread": monthly_spread,
         "rental_score_label": rental_score,
-        "investment_score": score,
+        "investment_score": None,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
 
