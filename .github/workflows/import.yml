@@ -1,4 +1,4 @@
-name: Import listings to Supabase
+name: Import listings to Supabase V2 DEBUG
 
 on:
   workflow_dispatch:
