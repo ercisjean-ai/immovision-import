@@ -1,6 +1,9 @@
 import os
+import re
 from datetime import datetime, timezone
 
+import requests
+from bs4 import BeautifulSoup
 from supabase import create_client
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
@@ -8,12 +11,26 @@ SUPABASE_KEY = os.environ["SUPABASE_ANON_KEY"]
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+}
+
 
 def get_source_id(source_name: str) -> str:
     result = supabase.table("sources").select("id").eq("name", source_name).limit(1).execute()
     if not result.data:
         raise ValueError(f"Source introuvable: {source_name}")
     return result.data[0]["id"]
+
+
+def fetch_search_targets() -> list[dict]:
+    result = (
+        supabase.table("search_targets")
+        .select("*")
+        .eq("is_active", True)
+        .execute()
+    )
+    return result.data or []
 
 
 def fetch_import_queue() -> list[dict]:
@@ -24,6 +41,106 @@ def fetch_import_queue() -> list[dict]:
         .execute()
     )
     return result.data or []
+
+
+def discover_immoweb_urls(search_target: dict) -> list[dict]:
+    url = search_target["search_url"]
+    response = requests.get(url, headers=HEADERS, timeout=30)
+    response.raise_for_status()
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    found = []
+
+    links = soup.find_all("a", href=True)
+    for a in links:
+        href = a["href"]
+
+        if "/fr/annonce/" not in href:
+            continue
+
+        if href.startswith("/"):
+            full_url = f"https://www.immoweb.be{href}"
+        elif href.startswith("http"):
+            full_url = href
+        else:
+            continue
+
+        match = re.search(r"/(\d{8,})", full_url)
+        listing_id = match.group(1) if match else None
+
+        found.append({
+            "source_name": search_target["source_name"],
+            "search_target_id": search_target["id"],
+            "source_url": full_url,
+            "source_listing_id": listing_id,
+        })
+
+    unique = {}
+    for item in found:
+        unique[item["source_url"]] = item
+    return list(unique.values())
+
+
+def upsert_discovered_url(item: dict) -> None:
+    payload = {
+        "source_name": item["source_name"],
+        "search_target_id": item["search_target_id"],
+        "source_url": item["source_url"],
+        "source_listing_id": item["source_listing_id"],
+        "last_seen_at": datetime.now(timezone.utc).isoformat(),
+        "is_active": True,
+    }
+    supabase.table("discovered_urls").upsert(payload, on_conflict="source_url").execute()
+
+
+def queue_new_discoveries() -> int:
+    discovered = (
+        supabase.table("discovered_urls")
+        .select("*")
+        .eq("is_active", True)
+        .eq("is_queued", False)
+        .execute()
+        .data
+    ) or []
+
+    queued = 0
+    for item in discovered:
+        source_listing_id = item.get("source_listing_id")
+        if not source_listing_id:
+            continue
+
+        existing = (
+            supabase.table("import_queue")
+            .select("id")
+            .eq("source_listing_id", source_listing_id)
+            .limit(1)
+            .execute()
+            .data
+        )
+        if existing:
+            supabase.table("discovered_urls").update({
+                "is_queued": True
+            }).eq("id", item["id"]).execute()
+            continue
+
+        payload = {
+            "source_name": item["source_name"],
+            "source_listing_id": source_listing_id,
+            "source_url": item["source_url"],
+            "is_active": True,
+            "is_live_data": True,
+            "notes": "URL découverte automatiquement depuis search_targets",
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        supabase.table("import_queue").insert(payload).execute()
+
+        supabase.table("discovered_urls").update({
+            "is_queued": True
+        }).eq("id", item["id"]).execute()
+
+        queued += 1
+
+    return queued
 
 
 def upsert_listing(item: dict) -> str:
@@ -128,7 +245,7 @@ def upsert_analysis(analysis_payload: dict) -> None:
     ).execute()
 
 
-def insert_price_history(listing_id: str, price: float | None) -> None:
+def insert_price_history(listing_id: str, price):
     if price is None:
         return
     supabase.table("listing_price_history").insert({
@@ -155,7 +272,7 @@ def update_source_counts() -> None:
         }).eq("id", source["id"]).execute()
 
 
-def insert_sync_log(status: str, listings_found: int, listings_imported: int, error_message: str | None = None) -> None:
+def insert_sync_log(status: str, listings_found: int, listings_imported: int, error_message=None) -> None:
     immoweb = supabase.table("sources").select("id").eq("name", "Immoweb").limit(1).execute().data
     source_id = immoweb[0]["id"] if immoweb else None
     supabase.table("source_syncs").insert({
@@ -171,9 +288,19 @@ def insert_sync_log(status: str, listings_found: int, listings_imported: int, er
 
 def main() -> None:
     imported = 0
-    queue = fetch_import_queue()
+    discovered_count = 0
 
     try:
+        targets = fetch_search_targets()
+        for target in targets:
+            discovered = discover_immoweb_urls(target)
+            for item in discovered:
+                upsert_discovered_url(item)
+            discovered_count += len(discovered)
+
+        queued = queue_new_discoveries()
+
+        queue = fetch_import_queue()
         for item in queue:
             listing_id = upsert_listing(item)
             item["listing_id"] = listing_id
@@ -183,10 +310,10 @@ def main() -> None:
             imported += 1
 
         update_source_counts()
-        insert_sync_log("success", len(queue), imported)
-        print(f"Import terminé: {imported} annonces traitées.")
+        insert_sync_log("success", discovered_count, imported)
+        print(f"Découverte: {discovered_count} URLs, import: {imported} annonces, nouvelles URLs envoyées en file: {queued}.")
     except Exception as e:
-        insert_sync_log("error", len(queue), imported, str(e))
+        insert_sync_log("error", discovered_count, imported, str(e))
         raise
 
 
