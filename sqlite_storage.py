@@ -1,4 +1,4 @@
-import sqlite3
+﻿import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -123,6 +123,10 @@ class SQLiteStorage(StorageBackend):
                 estimated_monthly_spread REAL,
                 rental_score_label TEXT,
                 investment_score REAL,
+                investment_score_label TEXT,
+                confidence_score REAL,
+                confidence_label TEXT,
+                confidence_reason TEXT,
                 updated_at TEXT
             )
             """,
@@ -131,6 +135,21 @@ class SQLiteStorage(StorageBackend):
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 listing_id INTEGER NOT NULL,
                 price REAL NOT NULL,
+                observed_at TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS listing_observation_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                listing_id INTEGER NOT NULL,
+                source_name TEXT NOT NULL,
+                source_listing_id TEXT,
+                source_url TEXT NOT NULL,
+                title TEXT,
+                price REAL,
+                commune TEXT,
+                postal_code TEXT,
+                is_active INTEGER NOT NULL DEFAULT 1,
                 observed_at TEXT NOT NULL
             )
             """,
@@ -152,6 +171,7 @@ class SQLiteStorage(StorageBackend):
             self.connection.execute(statement)
 
         self.connection.commit()
+        self._ensure_listing_analysis_columns()
         self._execute(
             """
             INSERT INTO sources (name)
@@ -160,6 +180,32 @@ class SQLiteStorage(StorageBackend):
             """,
             ("Immoweb",),
         )
+
+    def _ensure_listing_analysis_columns(self) -> None:
+        columns = {
+            row["name"]
+            for row in self.connection.execute("PRAGMA table_info(listing_analysis)")
+        }
+        if "investment_score_label" not in columns:
+            self.connection.execute(
+                "ALTER TABLE listing_analysis ADD COLUMN investment_score_label TEXT"
+            )
+            self.connection.commit()
+        if "confidence_score" not in columns:
+            self.connection.execute(
+                "ALTER TABLE listing_analysis ADD COLUMN confidence_score REAL"
+            )
+            self.connection.commit()
+        if "confidence_label" not in columns:
+            self.connection.execute(
+                "ALTER TABLE listing_analysis ADD COLUMN confidence_label TEXT"
+            )
+            self.connection.commit()
+        if "confidence_reason" not in columns:
+            self.connection.execute(
+                "ALTER TABLE listing_analysis ADD COLUMN confidence_reason TEXT"
+            )
+            self.connection.commit()
 
     def get_source_id(self, source_name: str) -> str:
         row = self._fetchone("SELECT id FROM sources WHERE name = ?", (source_name,))
@@ -366,9 +412,13 @@ class SQLiteStorage(StorageBackend):
                 estimated_monthly_spread,
                 rental_score_label,
                 investment_score,
+                investment_score_label,
+                confidence_score,
+                confidence_label,
+                confidence_reason,
                 updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(listing_id) DO UPDATE SET
                 zone_label = excluded.zone_label,
                 strategy_compatible = excluded.strategy_compatible,
@@ -382,6 +432,10 @@ class SQLiteStorage(StorageBackend):
                 estimated_monthly_spread = excluded.estimated_monthly_spread,
                 rental_score_label = excluded.rental_score_label,
                 investment_score = excluded.investment_score,
+                investment_score_label = excluded.investment_score_label,
+                confidence_score = excluded.confidence_score,
+                confidence_label = excluded.confidence_label,
+                confidence_reason = excluded.confidence_reason,
                 updated_at = excluded.updated_at
             """,
             (
@@ -398,12 +452,60 @@ class SQLiteStorage(StorageBackend):
                 analysis_payload["estimated_monthly_spread"],
                 analysis_payload["rental_score_label"],
                 analysis_payload["investment_score"],
+                analysis_payload.get("investment_score_label"),
+                analysis_payload.get("confidence_score"),
+                analysis_payload.get("confidence_label"),
+                analysis_payload.get("confidence_reason"),
                 analysis_payload["updated_at"],
+            ),
+        )
+
+    def insert_observation_history(self, listing_id: str, item: dict[str, Any]) -> None:
+        self._execute(
+            """
+            INSERT INTO listing_observation_history (
+                listing_id,
+                source_name,
+                source_listing_id,
+                source_url,
+                title,
+                price,
+                commune,
+                postal_code,
+                is_active,
+                observed_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(listing_id),
+                item["source_name"],
+                item.get("source_listing_id"),
+                item["source_url"],
+                item.get("title"),
+                item.get("price"),
+                item.get("commune"),
+                item.get("postal_code"),
+                int(bool(item.get("is_active", True))),
+                utcnow_iso(),
             ),
         )
 
     def insert_price_history(self, listing_id: str, price: Any) -> None:
         if price is None:
+            return
+
+        latest = self._fetchone(
+            """
+            SELECT price
+            FROM listing_price_history
+            WHERE listing_id = ?
+            ORDER BY observed_at DESC, id DESC
+            LIMIT 1
+            """,
+            (int(listing_id),),
+        )
+        if latest and float(latest["price"]) == float(price):
             return
 
         self._execute(

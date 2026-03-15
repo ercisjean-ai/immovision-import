@@ -1,4 +1,4 @@
-# immovision-import
+﻿# immovision-import
 
 ## Etat reel du depot
 
@@ -12,167 +12,122 @@ Fichiers presents dans le projet applicatif :
 - `sqlite_storage.py` : backend SQLite local
 - `supabase_storage.py` : backend Supabase
 - `business.py` : facade de compatibilite metier
-- `parsing.py` : parsing HTML et extraction
+- `parsing.py` : parsing HTML et extraction historique
 - `normalization.py` : normalisation des payloads
 - `analysis_logic.py` : calculs et logique d'analyse
 - `pipeline.py` : orchestration du pipeline
 - `seed_local.py` : seed SQLite local minimal
+- `listing_feed.py` : chargement d'un feed JSON/JSONL d'annonces
+- `ingest_listings.py` : ingestion d'un feed local vers `import_queue`
+- `sources\__init__.py` : facade des connecteurs de sources
+- `sources\immoweb_source.py` : connecteur Immoweb HTML / HTTP V1
+- `sources\immoweb_browser_source.py` : connecteur Immoweb live V2 via Playwright
+- `fetch_immoweb.py` : commande de collecte Immoweb vers JSONL ou `import_queue`
+- `sample_data\sample_listings.jsonl` : exemple de feed local
+- `sample_data\immoweb_search_fixture.html` : fixture HTML reproductible pour le connecteur Immoweb
 - `requirements.txt` : dependances Python
 - `.github/workflows/import.yml` : workflow GitHub Actions
 - `test_e2e_local.py` : test local de bout en bout ajoute
 - `test_refactor_smoke.py` : tests de fumee sur les modules extraits
+- `test_feed_ingestion.py` : tests du flux d'ingestion fichier et de l'historique
+- `test_immoweb_source.py` : tests du connecteur Immoweb HTTP / fixture
+- `test_immoweb_browser_source.py` : tests de la V2 Playwright sans reseau reel
 
-Ce qui n'est pas present dans le depot visible :
+## Connecteur Immoweb
 
-- aucun package Python
-- aucun autre module metier
-- aucune "phase 3/4" separee
-- aucun module de comparables
-- aucun module d'analyse d'opportunite avancee
-- aucun modele SQLite externe
-- aucun script d'installation Windows
+### V1 HTTP / fixture
 
-Le depot reel reste un pipeline d'import simple, maintenant decoupe en modules sans changer les commandes de lancement.
+- `sources\immoweb_source.py`
+- utilise `requests` pour le HTTP simple
+- reste utile pour la fixture locale et le parsing HTML brut
 
-## Role des modules
+### V2 Browser Playwright
 
-- `import.py` : wrapper minimal qui appelle `cli.main()`
-- `cli.py` : lance le pipeline avec la configuration courante
-- `config.py` : lit les variables d'environnement et choisit SQLite ou Supabase
-- `storage.py` : choisit et expose le backend de stockage
-- `storage_base.py` : definit l'interface attendue par le pipeline
-- `sqlite_storage.py` : contient toute la persistance locale SQLite
-- `supabase_storage.py` : contient toute la persistance Supabase
-- `business.py` : conserve une API stable vers les fonctions metier existantes
-- `parsing.py` : contient la decouverte Immoweb et l'extraction HTML
-- `normalization.py` : prepare les payloads normalises avant persistence
-- `analysis_logic.py` : contient les calculs et labels d'analyse
-- `pipeline.py` : relie stockage, decouverte, import et analyse
-- `seed_local.py` : insere un jeu minimal de donnees locales de test
+- `sources\immoweb_browser_source.py`
+- ouvre la page de recherche Immoweb dans Chromium via Playwright
+- attend le chargement utile
+- tente d'extraire les annonces depuis :
+  - le HTML rendu
+  - des scripts JSON embarques si presents
+- convertit les resultats vers le format interne actuel
+- echoue explicitement si Playwright n'est pas installe, si Chromium n'est pas installe, ou si le HTML rendu reste inexploitable
 
-## Mode local par defaut
+La fixture locale reste le chemin stable de test. Le live n'est jamais annonce comme succes si aucune annonce n'est extraite.
 
-Le script utilise SQLite par defaut.
-Supabase n'est active que si `SUPABASE_URL` et `SUPABASE_KEY` sont definies.
+## Historique metier local
 
-Base SQLite par defaut :
+Le pipeline conserve deux traces temporelles distinctes :
 
-```text
-.\immovision-local.db
-```
+- `listing_observation_history` : une observation a chaque import d'annonce, meme si le prix ne change pas
+- `listing_price_history` : uniquement le premier prix observe puis les vrais changements de prix
 
-Pour utiliser un autre fichier :
+## Installation Windows pour la V2 Playwright
+
+Dans la venv active :
 
 ```powershell
-$env:SQLITE_PATH = ".\data\immovision.db"
-```
-
-## Probleme actuel de la venv casse
-
-La venv presente dans le repo n'est pas fiable sur cette machine car son fichier `.\.venv\pyvenv.cfg` pointe vers un interpreteur qui n'existe plus :
-
-```text
-C:\Users\suryo\AppData\Local\Python\pythoncore-3.11-64\python.exe
-```
-
-Resultat :
-
-- `.\.venv\Scripts\python.exe` ne demarre pas correctement
-- `pytest` de cette venv ne peut pas etre lance proprement
-
-Il faut recreer une venv saine localement.
-
-## Procedure Windows exacte pour recreer une venv saine
-
-Depuis `D:\OneDrive\Desktop\immovision-import-main` :
-
-```powershell
-Remove-Item -Recurse -Force .\.venv
-py -3.11 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
-```
-
-Si `py` n'est pas disponible mais `python` 3.11 l'est :
-
-```powershell
-Remove-Item -Recurse -Force .\.venv
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-```
-
-Verification simple :
-
-```powershell
-python --version
-python -m pytest --version
+python -m playwright install chromium
 ```
 
 ## Commandes Windows exactes
 
-### Lancer le seed local minimal
+### Fixture locale stable
 
 ```powershell
 .\.venv\Scripts\Activate.ps1
-python seed_local.py
-```
-
-### Lancer le pipeline local complet
-
-```powershell
-.\.venv\Scripts\Activate.ps1
+python fetch_immoweb.py --html-file .\sample_data\immoweb_search_fixture.html
+python ingest_listings.py .\sample_data\immoweb_latest.jsonl --source-name Immoweb
 python import.py
 ```
 
-### Lancer le test minimal de bout en bout
+### Collecte live Immoweb via Playwright
 
 ```powershell
 .\.venv\Scripts\Activate.ps1
-python -m pytest test_e2e_local.py
+python fetch_immoweb.py --search-url "https://www.immoweb.be/fr/recherche/maison-et-appartement/a-vendre/bruxelles/province?countries=BE"
 ```
 
-### Lancer tous les tests presents
+Mode visible pour diagnostic :
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+python fetch_immoweb.py --search-url "https://www.immoweb.be/fr/recherche/maison-et-appartement/a-vendre/bruxelles/province?countries=BE" --headed
+```
+
+Ancien mode HTTP forcé pour comparaison :
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+python fetch_immoweb.py --search-url "https://www.immoweb.be/fr/recherche/maison-et-appartement/a-vendre/bruxelles/province?countries=BE" --http
+```
+
+Injection directe apres collecte :
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+python fetch_immoweb.py --search-url "https://www.immoweb.be/fr/recherche/maison-et-appartement/a-vendre/bruxelles/province?countries=BE" --ingest
+python import.py
+```
+
+### Tests
 
 ```powershell
 .\.venv\Scripts\Activate.ps1
 python -m pytest
 ```
 
-## Variables d'environnement utiles
-
-Variables reellement utiles :
-
-- aucune pour le mode local SQLite par defaut
-- `SQLITE_PATH` : optionnelle, pour choisir le fichier SQLite
-- `SUPABASE_URL` : optionnelle, seulement pour Supabase
-- `SUPABASE_KEY` : optionnelle, seulement pour Supabase
-- `SUPABASE_ANON_KEY` : alias encore accepte pour compatibilite
-
-## Test minimal de bout en bout reproductible
-
-1. Creer une venv saine.
-2. Installer les dependances.
-3. Lancer :
+Test cible sur la V2 navigateur :
 
 ```powershell
-python seed_local.py
-python import.py
+.\.venv\Scripts\Activate.ps1
+python -m pytest test_immoweb_browser_source.py
 ```
 
-4. Le script doit :
+## Limites actuelles
 
-- creer la base SQLite si elle n'existe pas
-- inserer ou mettre a jour un listing de test dans `import_queue`
-- importer ce listing dans `normalized_listings`
-- generer `listing_analysis`
-- generer `listing_price_history`
-- mettre a jour `sources`
-
-5. Validation automatisable :
-
-```powershell
-python -m pytest test_e2e_local.py
-```
+- pas de pagination automatique
+- pas de scraping detail annonce par annonce
+- pas de garanties si Immoweb durcit encore son anti-bot navigateur
+- l'extraction JSON embarquee est opportuniste, pas specialisee par schema Immoweb complet
+- le chemin le plus stable pour valider le projet reste toujours la fixture `sample_data\immoweb_search_fixture.html`

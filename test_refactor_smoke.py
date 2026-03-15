@@ -1,8 +1,13 @@
-from analysis_logic import build_analysis
+﻿from analysis_logic import (
+    build_analysis,
+    calculate_confidence_score,
+    calculate_investment_score,
+)
 from config import RuntimeConfig, load_config
 from normalization import build_listing_payload
 from parsing import extract_immoweb_listing_candidates
 from sqlite_storage import SQLiteStorage
+
 
 
 def test_build_analysis_keeps_current_formula():
@@ -20,7 +25,54 @@ def test_build_analysis_keeps_current_formula():
     assert analysis["estimated_total_rent_monthly"] == 1700
     assert analysis["estimated_monthly_loan_payment"] == 1386.25
     assert analysis["estimated_gross_yield"] == 8.16
-    assert analysis["compatibility_reason"] == "Cas test"
+    assert analysis["investment_score"] == 62
+    assert analysis["investment_score_label"] == "Moyen"
+    assert analysis["confidence_score"] == 60
+    assert analysis["confidence_label"] == "Correcte"
+    assert analysis["compatibility_reason"].startswith("Cas test | score 62/100 [Moyen] |")
+    assert "rendement:28/35" in analysis["compatibility_reason"]
+    assert "prix_unite:16/20" in analysis["compatibility_reason"]
+
+
+
+def test_calculate_investment_score_is_transparent():
+    score, label, explanation, compatible = calculate_investment_score(
+        {
+            "commune": "Ixelles",
+            "postal_code": "1050",
+            "existing_units": 3,
+            "surface": 240,
+            "property_type": "apartment_block",
+            "transaction_type": "sale",
+        },
+        gross_yield=10.36,
+        price_per_unit=110000,
+    )
+
+    assert score == 98
+    assert label == "Interessant"
+    assert compatible is True
+    assert "score 98/100 [Interessant]" in explanation
+    assert "rendement:35/35" in explanation
+    assert "localisation:5/5" in explanation
+
+
+
+def test_calculate_confidence_score_flags_missing_data():
+    score, label, explanation = calculate_confidence_score(
+        {
+            "title": "Annonce minimale",
+        },
+        gross_yield=None,
+        rent_per_unit=None,
+    )
+
+    assert score == 7
+    assert label == "Faible"
+    assert "confiance 7/100 [Faible]" in explanation
+    assert "prix:0/20" in explanation
+    assert "rendement:0/20" in explanation
+
 
 
 def test_extract_immoweb_listing_candidates_deduplicates_urls():
@@ -50,6 +102,7 @@ def test_extract_immoweb_listing_candidates_deduplicates_urls():
     ]
 
 
+
 def test_build_listing_payload_keeps_default_transaction_type():
     payload = build_listing_payload(
         {
@@ -62,6 +115,7 @@ def test_build_listing_payload_keeps_default_transaction_type():
     assert payload["source_id"] == "1"
     assert payload["source_listing_id"] == "12345678"
     assert payload["transaction_type"] == "sale"
+
 
 
 def test_load_config_defaults_to_sqlite(monkeypatch, tmp_path):
@@ -77,11 +131,13 @@ def test_load_config_defaults_to_sqlite(monkeypatch, tmp_path):
     assert config.sqlite_path == (tmp_path / "local.db").resolve()
 
 
+
 def test_sqlite_storage_bootstraps_sources(tmp_path):
     storage = SQLiteStorage(tmp_path / "immovision.db")
     source = storage._fetchone("SELECT name FROM sources WHERE name = ?", ("Immoweb",))
 
     assert source == {"name": "Immoweb"}
+
 
 
 def test_sqlite_storage_seed_api_inserts_queue_item(tmp_path):

@@ -1,6 +1,7 @@
-from analysis_logic import build_analysis
+﻿from analysis_logic import build_analysis
 from parsing import discover_immoweb_urls
 from storage import StorageBackend
+
 
 
 def run_pipeline(storage: StorageBackend) -> dict[str, int]:
@@ -21,6 +22,7 @@ def run_pipeline(storage: StorageBackend) -> dict[str, int]:
         listing_id = storage.upsert_listing(item)
         item["listing_id"] = listing_id
         storage.upsert_analysis(build_analysis(item))
+        storage.insert_observation_history(listing_id, item)
         storage.insert_price_history(listing_id, item.get("price"))
         imported += 1
 

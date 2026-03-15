@@ -1,4 +1,4 @@
-from typing import Any
+﻿from typing import Any
 
 
 class StorageBackend:
@@ -21,6 +21,9 @@ class StorageBackend:
         raise NotImplementedError
 
     def upsert_analysis(self, analysis_payload: dict[str, Any]) -> None:
+        raise NotImplementedError
+
+    def insert_observation_history(self, listing_id: str, item: dict[str, Any]) -> None:
         raise NotImplementedError
 
     def insert_price_history(self, listing_id: str, price: Any) -> None:

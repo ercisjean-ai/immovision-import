@@ -1,4 +1,4 @@
-from typing import Any
+﻿from typing import Any
 
 from config import utcnow_iso
 from normalization import build_listing_payload
@@ -132,14 +132,69 @@ class SupabaseStorage(StorageBackend):
         return result.data[0]["id"]
 
     def upsert_analysis(self, analysis_payload: dict[str, Any]) -> None:
+        supabase_payload = {
+            key: analysis_payload[key]
+            for key in [
+                "listing_id",
+                "zone_label",
+                "strategy_compatible",
+                "compatibility_reason",
+                "price_per_unit",
+                "estimated_rent_per_unit",
+                "estimated_total_rent_monthly",
+                "estimated_total_rent_annual",
+                "estimated_monthly_loan_payment",
+                "estimated_gross_yield",
+                "estimated_monthly_spread",
+                "rental_score_label",
+                "investment_score",
+                "confidence_score",
+                "confidence_label",
+                "confidence_reason",
+                "updated_at",
+            ]
+            if key in analysis_payload
+        }
         (
             self.client.table("listing_analysis")
-            .upsert(analysis_payload, on_conflict="listing_id")
+            .upsert(supabase_payload, on_conflict="listing_id")
             .execute()
         )
 
+    def insert_observation_history(self, listing_id: str, item: dict[str, Any]) -> None:
+        try:
+            self.client.table("listing_observation_history").insert(
+                {
+                    "listing_id": listing_id,
+                    "source_name": item["source_name"],
+                    "source_listing_id": item.get("source_listing_id"),
+                    "source_url": item["source_url"],
+                    "title": item.get("title"),
+                    "price": item.get("price"),
+                    "commune": item.get("commune"),
+                    "postal_code": item.get("postal_code"),
+                    "is_active": bool(item.get("is_active", True)),
+                    "observed_at": utcnow_iso(),
+                }
+            ).execute()
+        except Exception:
+            return
+
     def insert_price_history(self, listing_id: str, price: Any) -> None:
         if price is None:
+            return
+
+        latest = (
+            self.client.table("listing_price_history")
+            .select("price")
+            .eq("listing_id", listing_id)
+            .order("observed_at", desc=True)
+            .limit(1)
+            .execute()
+            .data
+        ) or []
+
+        if latest and float(latest[0]["price"]) == float(price):
             return
 
         self.client.table("listing_price_history").insert(
