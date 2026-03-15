@@ -1,4 +1,8 @@
 ﻿import json
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from time import monotonic
 from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
@@ -30,6 +34,26 @@ IMMOWEB_COOKIE_SELECTORS = [
     "button:has-text('Accept all')",
     "#uc-btn-accept-banner",
 ]
+NETWORK_JSON_HINTS = [
+    "graphql",
+    "api",
+    "search",
+    "classified",
+    "listing",
+    "result",
+    "property",
+]
+DEFAULT_DEBUG_DIR = Path("debug") / "immoweb"
+
+
+@dataclass
+class BrowserRenderResult:
+    html: str
+    final_url: str
+    page_title: str | None = None
+    network_payloads: list[object] = field(default_factory=list)
+    cookie_banner_seen: bool = False
+    screenshot_bytes: bytes | None = None
 
 
 
@@ -38,21 +62,35 @@ def collect_immoweb_browser_listings(
     *,
     timeout_ms: int = 45000,
     headless: bool = True,
+    debug_save_html: bool = False,
+    debug_screenshot: bool = False,
+    debug_dir: str | Path | None = None,
 ) -> list[dict[str, object]]:
-    html, final_url = render_immoweb_search_page_with_playwright(
+    result = render_immoweb_search_page_with_playwright(
         search_url,
         timeout_ms=timeout_ms,
         headless=headless,
+        capture_screenshot=debug_screenshot,
+        debug_save_html=debug_save_html,
+        debug_dir=debug_dir,
     )
 
-    embedded_items = extract_immoweb_embedded_listings(html)
-    html_items = parse_immoweb_search_results(html)
-    items = _merge_items_by_listing_id(embedded_items + html_items)
+    network_items = extract_immoweb_network_listings(result.network_payloads)
+    embedded_items = extract_immoweb_embedded_listings(result.html)
+    html_items = parse_immoweb_search_results(result.html)
+    items = _merge_items_by_listing_id(network_items + embedded_items + html_items)
 
     if not items:
+        artifact_paths = _persist_debug_artifacts(
+            html=result.html,
+            screenshot_bytes=result.screenshot_bytes,
+            debug_dir=debug_dir,
+            debug_save_html=debug_save_html,
+            debug_screenshot=debug_screenshot,
+        )
+        diagnostic = diagnose_immoweb_browser_failure(result)
         raise ImmowebFetchError(
-            f"Aucune annonce extraite depuis {final_url}. "
-            f"{diagnose_immoweb_empty_results(html)}"
+            f"Aucune annonce extraite depuis {result.final_url}. {diagnostic}{_format_artifact_suffix(artifact_paths)}"
         )
 
     return items
@@ -64,8 +102,15 @@ def render_immoweb_search_page_with_playwright(
     *,
     timeout_ms: int = 45000,
     headless: bool = True,
-) -> tuple[str, str]:
+    capture_screenshot: bool = False,
+    debug_save_html: bool = False,
+    debug_dir: str | Path | None = None,
+) -> BrowserRenderResult:
     sync_playwright, playwright_timeout_error = _load_playwright_sync_api()
+    page = None
+    browser = None
+    network_payloads: list[object] = []
+    cookie_banner_seen = False
 
     try:
         with sync_playwright() as playwright:
@@ -76,18 +121,58 @@ def render_immoweb_search_page_with_playwright(
                 viewport={"width": 1440, "height": 2200},
             )
             page = context.new_page()
-            page.goto(search_url, wait_until="domcontentloaded", timeout=timeout_ms)
-            _maybe_accept_cookie_banner(page)
-            page.wait_for_load_state("load", timeout=timeout_ms)
-            _wait_for_immoweb_content(page, timeout_ms=min(timeout_ms, 10000))
-            page.wait_for_timeout(1200)
-            html = page.content()
+            page.on("response", lambda response: _capture_network_payload(response, network_payloads))
+
+            initial_timeout_ms = min(timeout_ms, 15000)
+            page.goto(search_url, wait_until="commit", timeout=initial_timeout_ms)
+            _try_wait_for_state(page, "domcontentloaded", 6000)
+            page.wait_for_timeout(800)
+
+            cookie_banner_seen = _maybe_accept_cookie_banner(page) or cookie_banner_seen
+            page.wait_for_timeout(600)
+
+            _stabilize_immoweb_page(
+                page,
+                timeout_ms=max(1000, timeout_ms - initial_timeout_ms),
+            )
+
+            html = _safe_page_content(page)
+            page_title = _safe_page_title(page)
+            screenshot_bytes = _safe_page_screenshot(page) if capture_screenshot else None
             final_url = page.url
             browser.close()
-            return html, final_url
+            return BrowserRenderResult(
+                html=html,
+                final_url=final_url,
+                page_title=page_title,
+                network_payloads=network_payloads,
+                cookie_banner_seen=cookie_banner_seen,
+                screenshot_bytes=screenshot_bytes,
+            )
     except ImmowebFetchError:
         raise
     except Exception as exc:
+        html = _safe_page_content(page)
+        page_title = _safe_page_title(page)
+        screenshot_bytes = _safe_page_screenshot(page) if capture_screenshot else None
+        final_url = page.url if page is not None else search_url
+        artifact_paths = _persist_debug_artifacts(
+            html=html,
+            screenshot_bytes=screenshot_bytes,
+            debug_dir=debug_dir,
+            debug_save_html=debug_save_html,
+            debug_screenshot=capture_screenshot,
+        )
+        diagnostic = diagnose_immoweb_browser_failure(
+            BrowserRenderResult(
+                html=html,
+                final_url=final_url,
+                page_title=page_title,
+                network_payloads=network_payloads,
+                cookie_banner_seen=cookie_banner_seen,
+                screenshot_bytes=screenshot_bytes,
+            )
+        )
         message = str(exc)
         lowered = message.lower()
         if "executable doesn't exist" in lowered or "browser executable" in lowered:
@@ -96,11 +181,17 @@ def render_immoweb_search_page_with_playwright(
             ) from exc
         if "timeout" in lowered or exc.__class__.__name__ == getattr(playwright_timeout_error, "__name__", ""):
             raise ImmowebFetchError(
-                f"Timeout Playwright pendant le chargement de {search_url}."
+                f"Timeout Playwright pendant la navigation de {search_url}. {diagnostic}{_format_artifact_suffix(artifact_paths)}"
             ) from exc
         raise ImmowebFetchError(
-            f"Echec Playwright pendant la collecte Immoweb pour {search_url}: {message}"
+            f"Echec Playwright pendant la collecte Immoweb pour {search_url}: {message}. {diagnostic}{_format_artifact_suffix(artifact_paths)}"
         ) from exc
+    finally:
+        try:
+            if browser is not None:
+                browser.close()
+        except Exception:
+            pass
 
 
 
@@ -122,6 +213,45 @@ def extract_immoweb_embedded_listings(html: str) -> list[dict[str, object]]:
 
 
 
+def extract_immoweb_network_listings(network_payloads: list[object]) -> list[dict[str, object]]:
+    items: list[dict[str, object]] = []
+    for payload in network_payloads:
+        for candidate in _walk_json_objects(payload):
+            item = _build_listing_from_json_candidate(candidate)
+            if item is not None:
+                items.append(item)
+    return _merge_items_by_listing_id(items)
+
+
+
+def diagnose_immoweb_browser_failure(result: BrowserRenderResult) -> str:
+    html = result.html or ""
+    normalized = html.lower()
+    title = (result.page_title or "").strip()
+    parts: list[str] = []
+
+    if not html.strip():
+        parts.append("Page rendue vide apres navigation Playwright.")
+    elif _looks_like_antibot(normalized, title, result.final_url):
+        parts.append("La page rendue ressemble a un anti-bot ou a un acces refuse.")
+    elif result.cookie_banner_seen or _looks_like_consent_gate(normalized, title):
+        parts.append("Une banniere cookie/consentement ou un interstitiel semble encore bloquer le contenu utile.")
+    elif result.network_payloads:
+        parts.append(
+            f"{len(result.network_payloads)} reponses JSON utiles ont ete capturees, mais aucune annonce n'a pu etre mappee proprement."
+        )
+    elif "/fr/annonce/" in normalized or "/nl/annonce/" in normalized:
+        parts.append("Le DOM contient des traces d'annonces, mais le markup actuel n'a pas permis une extraction fiable.")
+    else:
+        parts.append(diagnose_immoweb_empty_results(html))
+
+    if title:
+        parts.append(f"Titre page: {title}.")
+
+    return " ".join(parts).strip()
+
+
+
 def _load_playwright_sync_api():
     try:
         from playwright.sync_api import TimeoutError, sync_playwright
@@ -133,25 +263,90 @@ def _load_playwright_sync_api():
 
 
 
-def _maybe_accept_cookie_banner(page) -> None:
+def _capture_network_payload(response, payloads: list[object]) -> None:
+    if len(payloads) >= 20:
+        return
+
+    try:
+        if response.status >= 400:
+            return
+        headers = {key.lower(): value for key, value in response.headers.items()}
+        content_type = headers.get("content-type", "").lower()
+        url = response.url.lower()
+        if "json" not in content_type and not any(token in url for token in NETWORK_JSON_HINTS):
+            return
+        text = response.text()
+        payload = _load_json_text(text)
+        if payload is None:
+            return
+        payloads.append(payload)
+    except Exception:
+        return
+
+
+
+def _stabilize_immoweb_page(page, timeout_ms: int) -> None:
+    deadline = monotonic() + (timeout_ms / 1000)
+
+    if _wait_for_any_selector(page, 2500):
+        return
+
+    _try_wait_for_state(page, "networkidle", 2500)
+    if _wait_for_any_selector(page, 1500):
+        return
+
+    _maybe_accept_cookie_banner(page)
+    page.wait_for_timeout(500)
+    if _wait_for_any_selector(page, 1500):
+        return
+
+    _scroll_page(page)
+    remaining_ms = max(500, int((deadline - monotonic()) * 1000))
+    _wait_for_any_selector(page, min(remaining_ms, 3000))
+    page.wait_for_timeout(800)
+
+
+
+def _wait_for_any_selector(page, timeout_ms: int) -> bool:
+    for selector in IMMOWEB_RESULT_WAIT_SELECTORS:
+        try:
+            page.locator(selector).first.wait_for(state="attached", timeout=timeout_ms)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+
+def _try_wait_for_state(page, state: str, timeout_ms: int) -> None:
+    try:
+        page.wait_for_load_state(state, timeout=timeout_ms)
+    except Exception:
+        return
+
+
+
+def _maybe_accept_cookie_banner(page) -> bool:
     for selector in IMMOWEB_COOKIE_SELECTORS:
         try:
             locator = page.locator(selector).first
             locator.wait_for(state="visible", timeout=1500)
             locator.click(timeout=1500)
-            return
+            return True
         except Exception:
             continue
+    return False
 
 
 
-def _wait_for_immoweb_content(page, timeout_ms: int) -> None:
-    for selector in IMMOWEB_RESULT_WAIT_SELECTORS:
-        try:
-            page.locator(selector).first.wait_for(state="attached", timeout=timeout_ms)
-            return
-        except Exception:
-            continue
+def _scroll_page(page) -> None:
+    try:
+        page.mouse.wheel(0, 1800)
+        page.wait_for_timeout(400)
+        page.mouse.wheel(0, 1800)
+        page.wait_for_timeout(400)
+    except Exception:
+        return
 
 
 
@@ -164,11 +359,19 @@ def _extract_json_payload(script) -> object | None:
     if not raw_text:
         return None
 
-    stripped = raw_text.strip()
+    return _load_json_text(raw_text.strip())
+
+
+
+def _load_json_text(text: str) -> object | None:
+    if not text:
+        return None
+
+    stripped = text.strip()
     if not stripped:
         return None
 
-    if script_type in {"application/ld+json", "application/json"} and stripped[:1] in "[{":
+    if stripped[:1] in "[{":
         try:
             return json.loads(stripped)
         except json.JSONDecodeError:
@@ -333,3 +536,90 @@ def _coerce_float(value: object) -> float | None:
 def _coerce_int(value: object) -> int | None:
     number = _coerce_float(value)
     return int(number) if number is not None else None
+
+
+
+def _safe_page_content(page) -> str:
+    if page is None:
+        return ""
+    try:
+        return page.content()
+    except Exception:
+        return ""
+
+
+
+def _safe_page_title(page) -> str | None:
+    if page is None:
+        return None
+    try:
+        return page.title()
+    except Exception:
+        return None
+
+
+
+def _safe_page_screenshot(page) -> bytes | None:
+    if page is None:
+        return None
+    try:
+        return page.screenshot(full_page=True, timeout=5000)
+    except Exception:
+        return None
+
+
+
+def _looks_like_antibot(normalized_html: str, title: str, final_url: str) -> bool:
+    lowered_title = title.lower()
+    lowered_url = final_url.lower()
+    return any(
+        token in normalized_html or token in lowered_title or token in lowered_url
+        for token in ["captcha", "access denied", "forbidden", "verify you are human", "robot", "bot detection"]
+    )
+
+
+
+def _looks_like_consent_gate(normalized_html: str, title: str) -> bool:
+    lowered_title = title.lower()
+    return any(
+        token in normalized_html or token in lowered_title
+        for token in ["cookie", "consent", "didomi", "onetrust", "tout accepter", "accept all"]
+    )
+
+
+
+def _persist_debug_artifacts(
+    *,
+    html: str,
+    screenshot_bytes: bytes | None,
+    debug_dir: str | Path | None,
+    debug_save_html: bool,
+    debug_screenshot: bool,
+) -> list[Path]:
+    if not debug_save_html and not debug_screenshot:
+        return []
+
+    target_dir = Path(debug_dir) if debug_dir is not None else DEFAULT_DEBUG_DIR
+    target_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    paths: list[Path] = []
+
+    if debug_save_html and html:
+        html_path = target_dir / f"immoweb_failure_{stamp}.html"
+        html_path.write_text(html, encoding="utf-8")
+        paths.append(html_path)
+
+    if debug_screenshot and screenshot_bytes:
+        screenshot_path = target_dir / f"immoweb_failure_{stamp}.png"
+        screenshot_path.write_bytes(screenshot_bytes)
+        paths.append(screenshot_path)
+
+    return paths
+
+
+
+def _format_artifact_suffix(paths: list[Path]) -> str:
+    if not paths:
+        return ""
+    rendered = ", ".join(str(path) for path in paths)
+    return f" Artefacts enregistres: {rendered}"

@@ -46,9 +46,26 @@ def main() -> None:
     )
     parser.add_argument(
         "--timeout-ms",
+        "--timeout",
+        dest="timeout_ms",
         type=int,
         default=45000,
-        help="Timeout Playwright pour la collecte live en millisecondes",
+        help="Timeout navigateur pour la collecte live en millisecondes",
+    )
+    parser.add_argument(
+        "--debug-save-html",
+        action="store_true",
+        help="Sauvegarde le HTML rendu en cas d'echec live",
+    )
+    parser.add_argument(
+        "--debug-screenshot",
+        action="store_true",
+        help="Sauvegarde un screenshot en cas d'echec live",
+    )
+    parser.add_argument(
+        "--debug-dir",
+        default=str(Path("debug") / "immoweb"),
+        help="Dossier de sortie des artefacts de debug Playwright",
     )
     args = parser.parse_args()
 
@@ -67,6 +84,9 @@ def main() -> None:
                 args.search_url,
                 timeout_ms=args.timeout_ms,
                 headless=not args.headed,
+                debug_save_html=args.debug_save_html,
+                debug_screenshot=args.debug_screenshot,
+                debug_dir=args.debug_dir,
             )
             collection_mode = "browser"
     except ImmowebFetchError as exc:

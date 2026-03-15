@@ -3,6 +3,7 @@
 import pytest
 
 import sources.immoweb_browser_source as browser_source
+from sources.immoweb_browser_source import BrowserRenderResult
 from sources.immoweb_source import ImmowebFetchError
 
 
@@ -14,7 +15,10 @@ def test_collect_immoweb_browser_listings_uses_rendered_html(monkeypatch: pytest
     monkeypatch.setattr(
         browser_source,
         "render_immoweb_search_page_with_playwright",
-        lambda *args, **kwargs: (FIXTURE_HTML, "https://www.immoweb.be/fr/recherche/test"),
+        lambda *args, **kwargs: BrowserRenderResult(
+            html=FIXTURE_HTML,
+            final_url="https://www.immoweb.be/fr/recherche/test",
+        ),
     )
 
     items = browser_source.collect_immoweb_browser_listings(
@@ -62,15 +66,43 @@ def test_extract_immoweb_embedded_listings_from_json_ld() -> None:
 
 
 
+def test_extract_immoweb_network_listings_from_payloads() -> None:
+    payloads = [
+        {
+            "results": [
+                {
+                    "url": "https://www.immoweb.be/fr/annonce/maison/a-vendre/etterbeek/87654321",
+                    "name": "Maison a Etterbeek",
+                    "description": "Bien de rapport",
+                    "price": 510000,
+                    "postalCode": "1040",
+                    "city": "Etterbeek",
+                    "surface": 190,
+                    "numberOfUnits": 2,
+                }
+            ]
+        }
+    ]
+
+    items = browser_source.extract_immoweb_network_listings(payloads)
+
+    assert len(items) == 1
+    assert items[0]["source_listing_id"] == "87654321"
+    assert items[0]["commune"] == "Etterbeek"
+    assert items[0]["price"] == 510000.0
+
+
+
 def test_collect_immoweb_browser_listings_raises_clear_error_on_rendered_empty_html(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
         browser_source,
         "render_immoweb_search_page_with_playwright",
-        lambda *args, **kwargs: (
-            "<html><body>Please enable JavaScript to continue.</body></html>",
-            "https://www.immoweb.be/fr/recherche/test",
+        lambda *args, **kwargs: BrowserRenderResult(
+            html="<html><body>Please enable JavaScript to continue.</body></html>",
+            final_url="https://www.immoweb.be/fr/recherche/test",
+            page_title="JavaScript required",
         ),
     )
 
@@ -82,3 +114,47 @@ def test_collect_immoweb_browser_listings_raises_clear_error_on_rendered_empty_h
     message = str(exc_info.value)
     assert "Aucune annonce extraite" in message
     assert "JavaScript" in message
+
+
+
+def test_collect_immoweb_browser_listings_saves_debug_artifacts_on_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        browser_source,
+        "render_immoweb_search_page_with_playwright",
+        lambda *args, **kwargs: BrowserRenderResult(
+            html="<html><body>Access denied</body></html>",
+            final_url="https://www.immoweb.be/fr/recherche/test",
+            page_title="Access denied",
+            screenshot_bytes=b"fakepng",
+        ),
+    )
+
+    with pytest.raises(ImmowebFetchError) as exc_info:
+        browser_source.collect_immoweb_browser_listings(
+            "https://www.immoweb.be/fr/recherche/test",
+            debug_save_html=True,
+            debug_screenshot=True,
+            debug_dir=tmp_path,
+        )
+
+    message = str(exc_info.value)
+    assert "Artefacts enregistres" in message
+    assert len(list(tmp_path.glob("*.html"))) == 1
+    assert len(list(tmp_path.glob("*.png"))) == 1
+
+
+
+def test_diagnose_immoweb_browser_failure_detects_cookie_gate() -> None:
+    diagnostic = browser_source.diagnose_immoweb_browser_failure(
+        BrowserRenderResult(
+            html="<html><body>Cookies - Tout accepter</body></html>",
+            final_url="https://www.immoweb.be/fr/recherche/test",
+            page_title="Consentement",
+            cookie_banner_seen=True,
+        )
+    )
+
+    assert "consentement" in diagnostic.lower() or "cookie" in diagnostic.lower()
