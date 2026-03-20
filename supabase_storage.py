@@ -1,8 +1,15 @@
 ﻿from typing import Any
 
 from config import utcnow_iso
-from normalization import build_listing_payload
-from storage_base import StorageBackend
+from normalization import build_listing_payload, normalize_feed_listing
+from storage_base import (
+    ListingUpsertResult,
+    StorageBackend,
+    build_effective_item,
+    compute_observation_change,
+    merge_listing_payload,
+    serialize_changed_fields,
+)
 
 try:
     from supabase import Client, create_client
@@ -19,6 +26,57 @@ class SupabaseStorage(StorageBackend):
                 "le backend Supabase."
             )
         self.client: Client = create_client(url, key)
+
+    def _select_rows_by_identity(
+        self,
+        table_name: str,
+        *,
+        source_name: str,
+        source_listing_id: str,
+        columns: str = "*",
+    ) -> list[dict[str, Any]]:
+        try:
+            return (
+                self.client.table(table_name)
+                .select(columns)
+                .eq("source_name", source_name)
+                .eq("source_listing_id", source_listing_id)
+                .limit(1)
+                .execute()
+                .data
+            ) or []
+        except Exception:
+            return (
+                self.client.table(table_name)
+                .select(columns)
+                .eq("source_listing_id", source_listing_id)
+                .limit(1)
+                .execute()
+                .data
+            ) or []
+
+    def _upsert_by_identity(
+        self,
+        table_name: str,
+        payload: dict[str, Any],
+    ):
+        try:
+            return (
+                self.client.table(table_name)
+                .upsert(payload, on_conflict="source_name,source_listing_id")
+                .execute()
+            )
+        except Exception:
+            legacy_payload = dict(payload)
+            if table_name == "normalized_listings":
+                legacy_payload.pop("source_name", None)
+            legacy_payload.pop("data_origin", None)
+            legacy_payload.pop("copro_status", None)
+            return (
+                self.client.table(table_name)
+                .upsert(legacy_payload, on_conflict="source_listing_id")
+                .execute()
+            )
 
     def get_source_id(self, source_name: str) -> str:
         result = (
@@ -81,13 +139,11 @@ class SupabaseStorage(StorageBackend):
             if not source_listing_id:
                 continue
 
-            existing = (
-                self.client.table("import_queue")
-                .select("id")
-                .eq("source_listing_id", source_listing_id)
-                .limit(1)
-                .execute()
-                .data
+            existing = self._select_rows_by_identity(
+                "import_queue",
+                source_name=item["source_name"],
+                source_listing_id=source_listing_id,
+                columns="id",
             )
 
             if existing:
@@ -105,11 +161,12 @@ class SupabaseStorage(StorageBackend):
                 "source_url": item["source_url"],
                 "is_active": True,
                 "is_live_data": True,
+                "data_origin": "live",
                 "notes": "URL decouverte automatiquement depuis search_targets",
                 "updated_at": utcnow_iso(),
             }
 
-            self.client.table("import_queue").insert(payload).execute()
+            self._upsert_by_identity("import_queue", payload)
 
             (
                 self.client.table("discovered_urls")
@@ -121,15 +178,52 @@ class SupabaseStorage(StorageBackend):
 
         return queued
 
-    def upsert_listing(self, item: dict[str, Any]) -> str:
+    def upsert_listing(self, item: dict[str, Any]) -> ListingUpsertResult:
         source_id = self.get_source_id(item["source_name"])
-        payload = build_listing_payload(item, source_id)
-        result = (
-            self.client.table("normalized_listings")
-            .upsert(payload, on_conflict="source_listing_id")
-            .execute()
+        existing_rows = self._select_rows_by_identity(
+            "normalized_listings",
+            source_name=item["source_name"],
+            source_listing_id=item["source_listing_id"],
         )
-        return result.data[0]["id"]
+        existing = existing_rows[0] if existing_rows else None
+        payload = build_listing_payload(item, source_id)
+        merged_payload = merge_listing_payload(existing, payload)
+        observation_status, changed_fields, is_price_changed = (
+            compute_observation_change(existing, merged_payload)
+        )
+        supabase_payload = {
+            key: merged_payload[key]
+            for key in [
+                "source_id",
+                "source_name",
+                "source_listing_id",
+                "source_url",
+                "title",
+                "description",
+                "price",
+                "postal_code",
+                "commune",
+                "property_type",
+                "transaction_type",
+                "existing_units",
+                "surface",
+                "is_copro",
+                "copro_status",
+                "is_new_build",
+                "is_live_data",
+                "data_origin",
+                "last_seen_at",
+            ]
+            if key in merged_payload
+        }
+        result = self._upsert_by_identity("normalized_listings", supabase_payload)
+        return ListingUpsertResult(
+            listing_id=str(result.data[0]["id"]),
+            observation_status=observation_status,
+            changed_fields=changed_fields,
+            is_price_changed=is_price_changed,
+            effective_item=build_effective_item(item, merged_payload),
+        )
 
     def upsert_analysis(self, analysis_payload: dict[str, Any]) -> None:
         supabase_payload = {
@@ -161,24 +255,50 @@ class SupabaseStorage(StorageBackend):
             .execute()
         )
 
-    def insert_observation_history(self, listing_id: str, item: dict[str, Any]) -> None:
+    def insert_observation_history(
+        self,
+        upsert_result: ListingUpsertResult,
+        item: dict[str, Any],
+    ) -> None:
+        payload = {
+            "listing_id": upsert_result.listing_id,
+            "source_name": item["source_name"],
+            "source_listing_id": item.get("source_listing_id"),
+            "source_url": item["source_url"],
+            "title": item.get("title"),
+            "price": item.get("price"),
+            "commune": item.get("commune"),
+            "postal_code": item.get("postal_code"),
+            "is_active": bool(item.get("is_active", True)),
+            "observation_status": upsert_result.observation_status,
+            "changed_fields": serialize_changed_fields(upsert_result.changed_fields),
+            "is_price_changed": bool(upsert_result.is_price_changed),
+            "observed_at": utcnow_iso(),
+        }
         try:
-            self.client.table("listing_observation_history").insert(
-                {
-                    "listing_id": listing_id,
-                    "source_name": item["source_name"],
-                    "source_listing_id": item.get("source_listing_id"),
-                    "source_url": item["source_url"],
-                    "title": item.get("title"),
-                    "price": item.get("price"),
-                    "commune": item.get("commune"),
-                    "postal_code": item.get("postal_code"),
-                    "is_active": bool(item.get("is_active", True)),
-                    "observed_at": utcnow_iso(),
-                }
-            ).execute()
+            self.client.table("listing_observation_history").insert(payload).execute()
         except Exception:
-            return
+            try:
+                legacy_payload = {
+                    key: payload[key]
+                    for key in [
+                        "listing_id",
+                        "source_name",
+                        "source_listing_id",
+                        "source_url",
+                        "title",
+                        "price",
+                        "commune",
+                        "postal_code",
+                        "is_active",
+                        "observed_at",
+                    ]
+                }
+                self.client.table("listing_observation_history").insert(
+                    legacy_payload
+                ).execute()
+            except Exception:
+                return
 
     def insert_price_history(self, listing_id: str, price: Any) -> None:
         if price is None:
@@ -254,27 +374,35 @@ class SupabaseStorage(StorageBackend):
         ).execute()
 
     def seed_import_queue_item(self, item: dict[str, Any]) -> None:
+        normalized_item = normalize_feed_listing(
+            item,
+            default_source_name=item.get("source_name") or "FileFeed",
+        )
         payload = {
-            "source_name": item["source_name"],
-            "source_listing_id": item["source_listing_id"],
-            "source_url": item["source_url"],
-            "title": item.get("title"),
-            "description": item.get("description"),
-            "price": item.get("price"),
-            "postal_code": item.get("postal_code"),
-            "commune": item.get("commune"),
-            "property_type": item.get("property_type"),
-            "transaction_type": item.get("transaction_type"),
-            "existing_units": item.get("existing_units"),
-            "surface": item.get("surface"),
-            "is_copro": item.get("is_copro", False),
-            "is_new_build": item.get("is_new_build", False),
-            "is_live_data": item.get("is_live_data", True),
-            "is_active": item.get("is_active", True),
-            "notes": item.get("notes"),
-            "updated_at": item.get("updated_at") or utcnow_iso(),
+            "source_name": normalized_item["source_name"],
+            "source_listing_id": normalized_item["source_listing_id"],
+            "source_url": normalized_item["source_url"],
+            "title": normalized_item.get("title"),
+            "description": normalized_item.get("description"),
+            "price": normalized_item.get("price"),
+            "postal_code": normalized_item.get("postal_code"),
+            "commune": normalized_item.get("commune"),
+            "property_type": normalized_item.get("property_type"),
+            "transaction_type": normalized_item.get("transaction_type"),
+            "existing_units": normalized_item.get("existing_units"),
+            "surface": normalized_item.get("surface"),
+            "is_copro": normalized_item.get("is_copro", False),
+            "copro_status": normalized_item.get("copro_status"),
+            "is_new_build": normalized_item.get("is_new_build", False),
+            "is_live_data": normalized_item.get("is_live_data", True),
+            "data_origin": normalized_item.get("data_origin"),
+            "is_active": normalized_item.get("is_active", True),
+            "notes": normalized_item.get("notes"),
+            "updated_at": normalized_item.get("updated_at") or utcnow_iso(),
         }
-        self.client.table("import_queue").upsert(
-            payload,
-            on_conflict="source_listing_id",
-        ).execute()
+        try:
+            self._upsert_by_identity("import_queue", payload)
+        except Exception:
+            legacy_payload = dict(payload)
+            legacy_payload.pop("copro_status", None)
+            self._upsert_by_identity("import_queue", legacy_payload)

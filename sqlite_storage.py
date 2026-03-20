@@ -3,8 +3,15 @@ from pathlib import Path
 from typing import Any
 
 from config import utcnow_iso
-from normalization import build_listing_payload
-from storage_base import StorageBackend
+from normalization import build_listing_payload, normalize_feed_listing
+from storage_base import (
+    ListingUpsertResult,
+    StorageBackend,
+    build_effective_item,
+    compute_observation_change,
+    merge_listing_payload,
+    serialize_changed_fields,
+)
 
 
 class SQLiteStorage(StorageBackend):
@@ -68,7 +75,7 @@ class SQLiteStorage(StorageBackend):
             CREATE TABLE IF NOT EXISTS import_queue (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 source_name TEXT NOT NULL,
-                source_listing_id TEXT NOT NULL UNIQUE,
+                source_listing_id TEXT NOT NULL,
                 source_url TEXT NOT NULL,
                 title TEXT,
                 description TEXT,
@@ -80,18 +87,22 @@ class SQLiteStorage(StorageBackend):
                 existing_units INTEGER,
                 surface REAL,
                 is_copro INTEGER NOT NULL DEFAULT 0,
+                copro_status TEXT,
                 is_new_build INTEGER NOT NULL DEFAULT 0,
                 is_live_data INTEGER NOT NULL DEFAULT 1,
+                data_origin TEXT,
                 is_active INTEGER NOT NULL DEFAULT 1,
                 notes TEXT,
-                updated_at TEXT
+                updated_at TEXT,
+                UNIQUE(source_name, source_listing_id)
             )
             """,
             """
             CREATE TABLE IF NOT EXISTS normalized_listings (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 source_id INTEGER NOT NULL,
-                source_listing_id TEXT NOT NULL UNIQUE,
+                source_name TEXT NOT NULL,
+                source_listing_id TEXT NOT NULL,
                 source_url TEXT NOT NULL,
                 title TEXT,
                 description TEXT,
@@ -103,9 +114,18 @@ class SQLiteStorage(StorageBackend):
                 existing_units INTEGER,
                 surface REAL,
                 is_copro INTEGER NOT NULL DEFAULT 0,
+                copro_status TEXT,
                 is_new_build INTEGER NOT NULL DEFAULT 0,
                 is_live_data INTEGER NOT NULL DEFAULT 1,
-                last_seen_at TEXT
+                data_origin TEXT,
+                last_seen_at TEXT,
+                first_seen_at TEXT,
+                observation_count INTEGER NOT NULL DEFAULT 0,
+                last_observation_status TEXT,
+                last_changed_at TEXT,
+                last_changed_fields TEXT,
+                last_price_change_at TEXT,
+                UNIQUE(source_name, source_listing_id)
             )
             """,
             """
@@ -113,6 +133,7 @@ class SQLiteStorage(StorageBackend):
                 listing_id INTEGER PRIMARY KEY,
                 zone_label TEXT,
                 strategy_compatible INTEGER,
+                strategy_label TEXT,
                 compatibility_reason TEXT,
                 price_per_unit REAL,
                 estimated_rent_per_unit REAL,
@@ -150,6 +171,9 @@ class SQLiteStorage(StorageBackend):
                 commune TEXT,
                 postal_code TEXT,
                 is_active INTEGER NOT NULL DEFAULT 1,
+                observation_status TEXT NOT NULL DEFAULT 'seen',
+                changed_fields TEXT,
+                is_price_changed INTEGER NOT NULL DEFAULT 0,
                 observed_at TEXT NOT NULL
             )
             """,
@@ -171,7 +195,12 @@ class SQLiteStorage(StorageBackend):
             self.connection.execute(statement)
 
         self.connection.commit()
+        self._ensure_import_queue_columns()
+        self._ensure_normalized_listing_columns()
+        self._ensure_import_queue_identity()
+        self._ensure_normalized_listing_identity()
         self._ensure_listing_analysis_columns()
+        self._ensure_observation_history_columns()
         self._execute(
             """
             INSERT INTO sources (name)
@@ -180,6 +209,237 @@ class SQLiteStorage(StorageBackend):
             """,
             ("Immoweb",),
         )
+
+    def _get_table_sql(self, table_name: str) -> str:
+        row = self.connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table_name,),
+        ).fetchone()
+        return str(row["sql"] or "") if row else ""
+
+    def _has_unique_index(
+        self,
+        table_name: str,
+        expected_columns: tuple[str, ...],
+    ) -> bool:
+        for index in self.connection.execute(f"PRAGMA index_list({table_name})"):
+            if not index["unique"]:
+                continue
+            index_name = index["name"]
+            columns = tuple(
+                row["name"]
+                for row in self.connection.execute(f"PRAGMA index_info({index_name})")
+            )
+            if columns == expected_columns:
+                return True
+        return False
+
+    def _ensure_import_queue_identity(self) -> None:
+        sql = self._get_table_sql("import_queue")
+        if self._has_unique_index("import_queue", ("source_name", "source_listing_id")) and (
+            "source_listing_id TEXT NOT NULL UNIQUE" not in sql
+        ):
+            return
+
+        self.connection.execute("DROP TABLE IF EXISTS import_queue_v2")
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS import_queue_v2 (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_name TEXT NOT NULL,
+                source_listing_id TEXT NOT NULL,
+                source_url TEXT NOT NULL,
+                title TEXT,
+                description TEXT,
+                price REAL,
+                postal_code TEXT,
+                commune TEXT,
+                property_type TEXT,
+                transaction_type TEXT,
+                existing_units INTEGER,
+                surface REAL,
+                is_copro INTEGER NOT NULL DEFAULT 0,
+                copro_status TEXT,
+                is_new_build INTEGER NOT NULL DEFAULT 0,
+                is_live_data INTEGER NOT NULL DEFAULT 1,
+                data_origin TEXT,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                notes TEXT,
+                updated_at TEXT,
+                UNIQUE(source_name, source_listing_id)
+            )
+            """
+        )
+        self.connection.execute(
+            """
+            INSERT INTO import_queue_v2 (
+                id,
+                source_name,
+                source_listing_id,
+                source_url,
+                title,
+                description,
+                price,
+                postal_code,
+                commune,
+                property_type,
+                transaction_type,
+                existing_units,
+                surface,
+                is_copro,
+                copro_status,
+                is_new_build,
+                is_live_data,
+                data_origin,
+                is_active,
+                notes,
+                updated_at
+            )
+            SELECT
+                id,
+                source_name,
+                source_listing_id,
+                source_url,
+                title,
+                description,
+                price,
+                postal_code,
+                commune,
+                property_type,
+                transaction_type,
+                existing_units,
+                surface,
+                is_copro,
+                copro_status,
+                is_new_build,
+                is_live_data,
+                data_origin,
+                is_active,
+                notes,
+                updated_at
+            FROM import_queue
+            """
+        )
+        self.connection.execute("DROP TABLE import_queue")
+        self.connection.execute("ALTER TABLE import_queue_v2 RENAME TO import_queue")
+        self.connection.commit()
+
+    def _ensure_normalized_listing_identity(self) -> None:
+        sql = self._get_table_sql("normalized_listings")
+        has_source_name_column = any(
+            row["name"] == "source_name"
+            for row in self.connection.execute("PRAGMA table_info(normalized_listings)")
+        )
+        if (
+            has_source_name_column
+            and self._has_unique_index(
+                "normalized_listings",
+                ("source_name", "source_listing_id"),
+            )
+            and "source_listing_id TEXT NOT NULL UNIQUE" not in sql
+        ):
+            return
+
+        self.connection.execute("DROP TABLE IF EXISTS normalized_listings_v2")
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS normalized_listings_v2 (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_id INTEGER NOT NULL,
+                source_name TEXT NOT NULL,
+                source_listing_id TEXT NOT NULL,
+                source_url TEXT NOT NULL,
+                title TEXT,
+                description TEXT,
+                price REAL,
+                postal_code TEXT,
+                commune TEXT,
+                property_type TEXT,
+                transaction_type TEXT,
+                existing_units INTEGER,
+                surface REAL,
+                is_copro INTEGER NOT NULL DEFAULT 0,
+                copro_status TEXT,
+                is_new_build INTEGER NOT NULL DEFAULT 0,
+                is_live_data INTEGER NOT NULL DEFAULT 1,
+                data_origin TEXT,
+                last_seen_at TEXT,
+                first_seen_at TEXT,
+                observation_count INTEGER NOT NULL DEFAULT 0,
+                last_observation_status TEXT,
+                last_changed_at TEXT,
+                last_changed_fields TEXT,
+                last_price_change_at TEXT,
+                UNIQUE(source_name, source_listing_id)
+            )
+            """
+        )
+        self.connection.execute(
+            """
+            INSERT INTO normalized_listings_v2 (
+                id,
+                source_id,
+                source_name,
+                source_listing_id,
+                source_url,
+                title,
+                description,
+                price,
+                postal_code,
+                commune,
+                property_type,
+                transaction_type,
+                existing_units,
+                surface,
+                is_copro,
+                copro_status,
+                is_new_build,
+                is_live_data,
+                data_origin,
+                last_seen_at,
+                first_seen_at,
+                observation_count,
+                last_observation_status,
+                last_changed_at,
+                last_changed_fields,
+                last_price_change_at
+            )
+            SELECT
+                normalized_listings.id,
+                normalized_listings.source_id,
+                COALESCE(sources.name, 'Unknown') AS source_name,
+                normalized_listings.source_listing_id,
+                normalized_listings.source_url,
+                normalized_listings.title,
+                normalized_listings.description,
+                normalized_listings.price,
+                normalized_listings.postal_code,
+                normalized_listings.commune,
+                normalized_listings.property_type,
+                normalized_listings.transaction_type,
+                normalized_listings.existing_units,
+                normalized_listings.surface,
+                normalized_listings.is_copro,
+                normalized_listings.copro_status,
+                normalized_listings.is_new_build,
+                normalized_listings.is_live_data,
+                normalized_listings.data_origin,
+                normalized_listings.last_seen_at,
+                normalized_listings.first_seen_at,
+                normalized_listings.observation_count,
+                normalized_listings.last_observation_status,
+                normalized_listings.last_changed_at,
+                normalized_listings.last_changed_fields,
+                normalized_listings.last_price_change_at
+            FROM normalized_listings
+            LEFT JOIN sources ON sources.id = normalized_listings.source_id
+            """
+        )
+        self.connection.execute("DROP TABLE normalized_listings")
+        self.connection.execute(
+            "ALTER TABLE normalized_listings_v2 RENAME TO normalized_listings"
+        )
+        self.connection.commit()
 
     def _ensure_listing_analysis_columns(self) -> None:
         columns = {
@@ -204,6 +464,182 @@ class SQLiteStorage(StorageBackend):
         if "confidence_reason" not in columns:
             self.connection.execute(
                 "ALTER TABLE listing_analysis ADD COLUMN confidence_reason TEXT"
+            )
+            self.connection.commit()
+        if "strategy_label" not in columns:
+            self.connection.execute(
+                "ALTER TABLE listing_analysis ADD COLUMN strategy_label TEXT"
+            )
+            self.connection.commit()
+
+    def _ensure_import_queue_columns(self) -> None:
+        columns = {
+            row["name"]
+            for row in self.connection.execute("PRAGMA table_info(import_queue)")
+        }
+        if "copro_status" not in columns:
+            self.connection.execute(
+                "ALTER TABLE import_queue ADD COLUMN copro_status TEXT"
+            )
+            self.connection.commit()
+        if "data_origin" not in columns:
+            self.connection.execute(
+                "ALTER TABLE import_queue ADD COLUMN data_origin TEXT"
+            )
+            self.connection.commit()
+        self.connection.execute(
+            """
+            UPDATE import_queue
+            SET copro_status = 'true'
+            WHERE copro_status IS NULL AND is_copro = 1
+            """
+        )
+        self.connection.execute(
+            """
+            UPDATE import_queue
+            SET data_origin = 'seed'
+            WHERE data_origin IS NULL
+              AND LOWER(COALESCE(notes, '')) LIKE '%seed local%'
+            """
+        )
+        self.connection.execute(
+            """
+            UPDATE import_queue
+            SET data_origin = 'test'
+            WHERE data_origin IS NULL
+              AND (
+                LOWER(COALESCE(source_url, '')) LIKE '%example.test%'
+                OR LOWER(COALESCE(notes, '')) LIKE 'cas test%'
+                OR LOWER(COALESCE(notes, '')) LIKE 'test%'
+              )
+            """
+        )
+        self.connection.execute(
+            """
+            UPDATE import_queue
+            SET data_origin = 'file_feed'
+            WHERE data_origin IS NULL
+              AND LOWER(COALESCE(source_name, '')) IN ('filefeed', 'manualfeed')
+            """
+        )
+        self.connection.commit()
+
+    def _ensure_normalized_listing_columns(self) -> None:
+        columns = {
+            row["name"]
+            for row in self.connection.execute("PRAGMA table_info(normalized_listings)")
+        }
+        if "source_name" not in columns:
+            self.connection.execute(
+                "ALTER TABLE normalized_listings ADD COLUMN source_name TEXT"
+            )
+            self.connection.commit()
+        self.connection.execute(
+            """
+            UPDATE normalized_listings
+            SET source_name = (
+                SELECT sources.name
+                FROM sources
+                WHERE sources.id = normalized_listings.source_id
+            )
+            WHERE source_name IS NULL OR source_name = ''
+            """
+        )
+        self.connection.commit()
+        if "first_seen_at" not in columns:
+            self.connection.execute(
+                "ALTER TABLE normalized_listings ADD COLUMN first_seen_at TEXT"
+            )
+            self.connection.commit()
+        if "observation_count" not in columns:
+            self.connection.execute(
+                "ALTER TABLE normalized_listings ADD COLUMN observation_count INTEGER NOT NULL DEFAULT 0"
+            )
+            self.connection.commit()
+        if "last_observation_status" not in columns:
+            self.connection.execute(
+                "ALTER TABLE normalized_listings ADD COLUMN last_observation_status TEXT"
+            )
+            self.connection.commit()
+        if "last_changed_at" not in columns:
+            self.connection.execute(
+                "ALTER TABLE normalized_listings ADD COLUMN last_changed_at TEXT"
+            )
+            self.connection.commit()
+        if "last_changed_fields" not in columns:
+            self.connection.execute(
+                "ALTER TABLE normalized_listings ADD COLUMN last_changed_fields TEXT"
+            )
+            self.connection.commit()
+        if "last_price_change_at" not in columns:
+            self.connection.execute(
+                "ALTER TABLE normalized_listings ADD COLUMN last_price_change_at TEXT"
+            )
+            self.connection.commit()
+        if "copro_status" not in columns:
+            self.connection.execute(
+                "ALTER TABLE normalized_listings ADD COLUMN copro_status TEXT"
+            )
+            self.connection.commit()
+        if "data_origin" not in columns:
+            self.connection.execute(
+                "ALTER TABLE normalized_listings ADD COLUMN data_origin TEXT"
+            )
+            self.connection.commit()
+        self.connection.execute(
+            """
+            UPDATE normalized_listings
+            SET copro_status = 'true'
+            WHERE copro_status IS NULL AND is_copro = 1
+            """
+        )
+        self.connection.execute(
+            """
+            UPDATE normalized_listings
+            SET data_origin = 'seed'
+            WHERE data_origin IS NULL
+              AND source_listing_id = '12345678'
+              AND LOWER(COALESCE(title, '')) LIKE '%test local%'
+            """
+        )
+        self.connection.execute(
+            """
+            UPDATE normalized_listings
+            SET data_origin = 'test'
+            WHERE data_origin IS NULL
+              AND LOWER(COALESCE(source_url, '')) LIKE '%example.test%'
+            """
+        )
+        self.connection.execute(
+            """
+            UPDATE normalized_listings
+            SET data_origin = 'file_feed'
+            WHERE data_origin IS NULL
+              AND LOWER(COALESCE(source_name, '')) IN ('filefeed', 'manualfeed')
+            """
+        )
+        self.connection.commit()
+
+    def _ensure_observation_history_columns(self) -> None:
+        columns = {
+            row["name"]
+            for row in self.connection.execute(
+                "PRAGMA table_info(listing_observation_history)"
+            )
+        }
+        if "observation_status" not in columns:
+            self.connection.execute(
+                "ALTER TABLE listing_observation_history ADD COLUMN observation_status TEXT NOT NULL DEFAULT 'seen'"
+            )
+            self.connection.commit()
+        if "changed_fields" not in columns:
+            self.connection.execute(
+                "ALTER TABLE listing_observation_history ADD COLUMN changed_fields TEXT"
+            )
+            self.connection.commit()
+        if "is_price_changed" not in columns:
+            self.connection.execute(
+                "ALTER TABLE listing_observation_history ADD COLUMN is_price_changed INTEGER NOT NULL DEFAULT 0"
             )
             self.connection.commit()
 
@@ -283,8 +719,12 @@ class SQLiteStorage(StorageBackend):
                 continue
 
             existing = self._fetchone(
-                "SELECT id FROM import_queue WHERE source_listing_id = ?",
-                (source_listing_id,),
+                """
+                SELECT id
+                FROM import_queue
+                WHERE source_name = ? AND source_listing_id = ?
+                """,
+                (item["source_name"], source_listing_id),
             )
 
             if existing:
@@ -302,15 +742,17 @@ class SQLiteStorage(StorageBackend):
                     source_url,
                     is_active,
                     is_live_data,
+                    data_origin,
                     notes,
                     updated_at
                 )
-                VALUES (?, ?, ?, 1, 1, ?, ?)
+                VALUES (?, ?, ?, 1, 1, ?, ?, ?)
                 """,
                 (
                     item["source_name"],
                     source_listing_id,
                     item["source_url"],
+                    "live",
                     "URL decouverte automatiquement depuis search_targets",
                     utcnow_iso(),
                 ),
@@ -323,13 +765,43 @@ class SQLiteStorage(StorageBackend):
 
         return queued
 
-    def upsert_listing(self, item: dict[str, Any]) -> str:
+    def upsert_listing(self, item: dict[str, Any]) -> ListingUpsertResult:
         source_id = self.get_source_id(item["source_name"])
+        existing = self._fetchone(
+            """
+            SELECT *
+            FROM normalized_listings
+            WHERE source_name = ? AND source_listing_id = ?
+            """,
+            (item["source_name"], item["source_listing_id"]),
+        )
         payload = build_listing_payload(item, source_id)
+        merged_payload = merge_listing_payload(existing, payload)
+        observation_status, changed_fields, is_price_changed = (
+            compute_observation_change(existing, merged_payload)
+        )
+        now = utcnow_iso()
+        first_seen_at = (existing or {}).get("first_seen_at") or now
+        previous_observation_count = int((existing or {}).get("observation_count") or 0)
+        merged_payload["first_seen_at"] = first_seen_at
+        merged_payload["observation_count"] = previous_observation_count + 1
+        merged_payload["last_observation_status"] = observation_status
+        merged_payload["last_changed_at"] = (
+            now
+            if observation_status in {"new", "modified"}
+            else (existing or {}).get("last_changed_at")
+        )
+        merged_payload["last_changed_fields"] = serialize_changed_fields(changed_fields)
+        merged_payload["last_price_change_at"] = (
+            now
+            if is_price_changed
+            else (existing or {}).get("last_price_change_at")
+        )
         self._execute(
             """
             INSERT INTO normalized_listings (
                 source_id,
+                source_name,
                 source_listing_id,
                 source_url,
                 title,
@@ -342,12 +814,20 @@ class SQLiteStorage(StorageBackend):
                 existing_units,
                 surface,
                 is_copro,
+                copro_status,
                 is_new_build,
                 is_live_data,
-                last_seen_at
+                data_origin,
+                last_seen_at,
+                first_seen_at,
+                observation_count,
+                last_observation_status,
+                last_changed_at,
+                last_changed_fields,
+                last_price_change_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(source_listing_id) DO UPDATE SET
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(source_name, source_listing_id) DO UPDATE SET
                 source_id = excluded.source_id,
                 source_url = excluded.source_url,
                 title = excluded.title,
@@ -360,40 +840,63 @@ class SQLiteStorage(StorageBackend):
                 existing_units = excluded.existing_units,
                 surface = excluded.surface,
                 is_copro = excluded.is_copro,
+                copro_status = excluded.copro_status,
                 is_new_build = excluded.is_new_build,
                 is_live_data = excluded.is_live_data,
-                last_seen_at = excluded.last_seen_at
+                data_origin = excluded.data_origin,
+                last_seen_at = excluded.last_seen_at,
+                first_seen_at = excluded.first_seen_at,
+                observation_count = excluded.observation_count,
+                last_observation_status = excluded.last_observation_status,
+                last_changed_at = excluded.last_changed_at,
+                last_changed_fields = excluded.last_changed_fields,
+                last_price_change_at = excluded.last_price_change_at
             """,
             (
-                payload["source_id"],
-                payload["source_listing_id"],
-                payload["source_url"],
-                payload["title"],
-                payload["description"],
-                payload["price"],
-                payload["postal_code"],
-                payload["commune"],
-                payload["property_type"],
-                payload["transaction_type"],
-                payload["existing_units"],
-                payload["surface"],
-                int(bool(payload["is_copro"])),
-                int(bool(payload["is_new_build"])),
-                int(bool(payload["is_live_data"])),
-                payload["last_seen_at"],
+                merged_payload["source_id"],
+                merged_payload["source_name"],
+                merged_payload["source_listing_id"],
+                merged_payload["source_url"],
+                merged_payload["title"],
+                merged_payload["description"],
+                merged_payload["price"],
+                merged_payload["postal_code"],
+                merged_payload["commune"],
+                merged_payload["property_type"],
+                merged_payload["transaction_type"],
+                merged_payload["existing_units"],
+                merged_payload["surface"],
+                int(bool(merged_payload["is_copro"])),
+                merged_payload.get("copro_status"),
+                int(bool(merged_payload["is_new_build"])),
+                int(bool(merged_payload["is_live_data"])),
+                merged_payload.get("data_origin"),
+                merged_payload["last_seen_at"],
+                merged_payload["first_seen_at"],
+                merged_payload["observation_count"],
+                merged_payload["last_observation_status"],
+                merged_payload["last_changed_at"],
+                merged_payload["last_changed_fields"],
+                merged_payload["last_price_change_at"],
             ),
         )
         row = self._fetchone(
             """
             SELECT id
             FROM normalized_listings
-            WHERE source_listing_id = ?
+            WHERE source_name = ? AND source_listing_id = ?
             """,
-            (payload["source_listing_id"],),
+            (merged_payload["source_name"], merged_payload["source_listing_id"]),
         )
         if row is None:
             raise RuntimeError("Impossible de retrouver le listing apres upsert SQLite.")
-        return str(row["id"])
+        return ListingUpsertResult(
+            listing_id=str(row["id"]),
+            observation_status=observation_status,
+            changed_fields=changed_fields,
+            is_price_changed=is_price_changed,
+            effective_item=build_effective_item(item, merged_payload),
+        )
 
     def upsert_analysis(self, analysis_payload: dict[str, Any]) -> None:
         self._execute(
@@ -402,6 +905,7 @@ class SQLiteStorage(StorageBackend):
                 listing_id,
                 zone_label,
                 strategy_compatible,
+                strategy_label,
                 compatibility_reason,
                 price_per_unit,
                 estimated_rent_per_unit,
@@ -418,10 +922,11 @@ class SQLiteStorage(StorageBackend):
                 confidence_reason,
                 updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(listing_id) DO UPDATE SET
                 zone_label = excluded.zone_label,
                 strategy_compatible = excluded.strategy_compatible,
+                strategy_label = excluded.strategy_label,
                 compatibility_reason = excluded.compatibility_reason,
                 price_per_unit = excluded.price_per_unit,
                 estimated_rent_per_unit = excluded.estimated_rent_per_unit,
@@ -442,6 +947,7 @@ class SQLiteStorage(StorageBackend):
                 int(analysis_payload["listing_id"]),
                 analysis_payload["zone_label"],
                 int(bool(analysis_payload["strategy_compatible"])),
+                analysis_payload.get("strategy_label"),
                 analysis_payload["compatibility_reason"],
                 analysis_payload["price_per_unit"],
                 analysis_payload["estimated_rent_per_unit"],
@@ -460,7 +966,11 @@ class SQLiteStorage(StorageBackend):
             ),
         )
 
-    def insert_observation_history(self, listing_id: str, item: dict[str, Any]) -> None:
+    def insert_observation_history(
+        self,
+        upsert_result: ListingUpsertResult,
+        item: dict[str, Any],
+    ) -> None:
         self._execute(
             """
             INSERT INTO listing_observation_history (
@@ -473,12 +983,15 @@ class SQLiteStorage(StorageBackend):
                 commune,
                 postal_code,
                 is_active,
+                observation_status,
+                changed_fields,
+                is_price_changed,
                 observed_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                int(listing_id),
+                int(upsert_result.listing_id),
                 item["source_name"],
                 item.get("source_listing_id"),
                 item["source_url"],
@@ -487,6 +1000,9 @@ class SQLiteStorage(StorageBackend):
                 item.get("commune"),
                 item.get("postal_code"),
                 int(bool(item.get("is_active", True))),
+                upsert_result.observation_status,
+                serialize_changed_fields(upsert_result.changed_fields),
+                int(bool(upsert_result.is_price_changed)),
                 utcnow_iso(),
             ),
         )
@@ -572,6 +1088,10 @@ class SQLiteStorage(StorageBackend):
         )
 
     def seed_import_queue_item(self, item: dict[str, Any]) -> None:
+        normalized_item = normalize_feed_listing(
+            item,
+            default_source_name=item.get("source_name") or "FileFeed",
+        )
         self._execute(
             """
             INSERT INTO import_queue (
@@ -588,14 +1108,16 @@ class SQLiteStorage(StorageBackend):
                 existing_units,
                 surface,
                 is_copro,
+                copro_status,
                 is_new_build,
                 is_live_data,
+                data_origin,
                 is_active,
                 notes,
                 updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(source_listing_id) DO UPDATE SET
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(source_name, source_listing_id) DO UPDATE SET
                 source_url = excluded.source_url,
                 title = excluded.title,
                 description = excluded.description,
@@ -607,30 +1129,34 @@ class SQLiteStorage(StorageBackend):
                 existing_units = excluded.existing_units,
                 surface = excluded.surface,
                 is_copro = excluded.is_copro,
+                copro_status = excluded.copro_status,
                 is_new_build = excluded.is_new_build,
                 is_live_data = excluded.is_live_data,
+                data_origin = excluded.data_origin,
                 is_active = excluded.is_active,
                 notes = excluded.notes,
                 updated_at = excluded.updated_at
             """,
             (
-                item["source_name"],
-                item["source_listing_id"],
-                item["source_url"],
-                item.get("title"),
-                item.get("description"),
-                item.get("price"),
-                item.get("postal_code"),
-                item.get("commune"),
-                item.get("property_type"),
-                item.get("transaction_type"),
-                item.get("existing_units"),
-                item.get("surface"),
-                int(bool(item.get("is_copro", False))),
-                int(bool(item.get("is_new_build", False))),
-                int(bool(item.get("is_live_data", True))),
-                int(bool(item.get("is_active", True))),
-                item.get("notes"),
-                item.get("updated_at") or utcnow_iso(),
+                normalized_item["source_name"],
+                normalized_item["source_listing_id"],
+                normalized_item["source_url"],
+                normalized_item.get("title"),
+                normalized_item.get("description"),
+                normalized_item.get("price"),
+                normalized_item.get("postal_code"),
+                normalized_item.get("commune"),
+                normalized_item.get("property_type"),
+                normalized_item.get("transaction_type"),
+                normalized_item.get("existing_units"),
+                normalized_item.get("surface"),
+                int(bool(normalized_item.get("is_copro", False))),
+                normalized_item.get("copro_status"),
+                int(bool(normalized_item.get("is_new_build", False))),
+                int(bool(normalized_item.get("is_live_data", True))),
+                normalized_item.get("data_origin"),
+                int(bool(normalized_item.get("is_active", True))),
+                normalized_item.get("notes"),
+                normalized_item.get("updated_at") or utcnow_iso(),
             ),
         )

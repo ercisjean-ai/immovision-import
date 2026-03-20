@@ -3,3 +3,4 @@ supabase
 beautifulsoup4
 playwright
 pytest
+tzdata

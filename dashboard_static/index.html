@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Immovision Dashboard</title>
+    <link rel="stylesheet" href="/static/styles.css">
+  </head>
+  <body>
+    <div class="shell">
+      <header class="hero">
+        <div class="hero-copy">
+          <p class="eyebrow">Immovision / Investissement Locatif</p>
+          <h1>Tableau de bord relié aux vraies annonces du moteur</h1>
+          <p class="hero-text">
+            Priorisation réelle selon la stratégie investisseur : prix par unité, unités existantes, copropriété,
+            zone cible, source et stabilité d’observation.
+          </p>
+        </div>
+        <div class="hero-meta" id="hero-meta">
+          <div class="meta-card">
+            <span class="meta-label">Base</span>
+            <span class="meta-value" id="database-path">-</span>
+          </div>
+          <div class="meta-card">
+            <span class="meta-label">Dernière lecture</span>
+            <span class="meta-value" id="generated-at">-</span>
+          </div>
+        </div>
+      </header>
+
+      <main class="layout">
+        <section class="summary-grid" id="summary-grid"></section>
+        <section class="sections" id="sections"></section>
+      </main>
+    </div>
+
+    <template id="summary-card-template">
+      <article class="summary-card">
+        <span class="summary-label"></span>
+        <strong class="summary-value"></strong>
+      </article>
+    </template>
+
+    <template id="section-template">
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <h2 class="panel-title"></h2>
+            <p class="panel-subtitle"></p>
+          </div>
+          <span class="panel-count"></span>
+        </div>
+        <div class="listing-grid"></div>
+        <p class="empty-state">Aucune annonce dans cette vue.</p>
+      </section>
+    </template>
+
+    <template id="listing-card-template">
+      <article class="listing-card">
+        <div class="listing-top">
+          <div class="listing-badges">
+            <span class="badge source-badge"></span>
+            <span class="badge strategy-badge"></span>
+            <span class="badge observation-badge"></span>
+          </div>
+          <a class="open-link" target="_blank" rel="noreferrer">Ouvrir l’annonce</a>
+        </div>
+        <h3 class="listing-title"></h3>
+        <p class="listing-location"></p>
+        <dl class="metrics">
+          <div><dt>Prix total</dt><dd class="metric-price"></dd></div>
+          <div><dt>Unités</dt><dd class="metric-units"></dd></div>
+          <div><dt>Prix / unité</dt><dd class="metric-ppu"></dd></div>
+          <div><dt>Score inv.</dt><dd class="metric-investment"></dd></div>
+          <div><dt>Confiance</dt><dd class="metric-confidence"></dd></div>
+          <div><dt>Vu</dt><dd class="metric-last-seen"></dd></div>
+        </dl>
+        <p class="listing-reason"></p>
+      </article>
+    </template>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

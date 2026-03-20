@@ -1,4 +1,4 @@
-﻿import json
+import json
 import re
 from pathlib import Path
 from typing import Any
@@ -86,10 +86,12 @@ def collect_immoweb_listings(
     html: str | None = None,
     html_file: str | Path | None = None,
 ) -> list[dict[str, Any]]:
+    data_origin = "fixture"
     if html is None and html_file is not None:
         html = Path(html_file).read_text(encoding="utf-8")
     if html is None and search_url:
         html = fetch_immoweb_search_page(search_url)
+        data_origin = "live"
     if html is None:
         raise ValueError("Fournis search_url, html ou html_file.")
 
@@ -98,7 +100,7 @@ def collect_immoweb_listings(
         raise ImmowebFetchError(
             f"Aucune annonce extraite depuis {search_url}. {diagnose_immoweb_empty_results(html)}"
         )
-    return items
+    return [{**item, "data_origin": data_origin} for item in items]
 
 
 
@@ -262,8 +264,33 @@ def _extract_existing_units(text: str) -> int | None:
 
 def _extract_property_type(text: str) -> str | None:
     normalized = text.lower()
+    if any(
+        token in normalized
+        for token in (
+            "maison de commerce",
+            "commerce house",
+            "handelshuis",
+            "woning met handelszaak",
+            "immeuble mixte",
+            "mixed use building",
+        )
+    ):
+        return "commercial_house"
     if "immeuble de rapport" in normalized or "building with" in normalized:
         return "apartment_block"
+    if any(
+        token in normalized
+        for token in (
+            "commerce",
+            "commercial",
+            "shop",
+            "retail",
+            "horeca",
+            "winkel",
+            "handelszaak",
+        )
+    ):
+        return "commercial"
     if "maison" in normalized or "house" in normalized:
         return "house"
     if "appartement" in normalized or "apartment" in normalized or "flat" in normalized:
@@ -277,3 +304,4 @@ def _extract_transaction_type(url: str, text: str) -> str:
     if any(token in normalized for token in ("a-louer", "for-rent", "rent")):
         return "rent"
     return "sale"
+

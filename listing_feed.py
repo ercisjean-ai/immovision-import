@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from normalization import normalize_feed_listing
+from normalization import normalize_feed_listing, resolve_data_origin
 
 
 def load_listing_feed(
@@ -22,10 +22,29 @@ def load_listing_feed(
             f"Format non supporte pour {feed_path.name}. Utilise .jsonl ou .json."
         )
 
-    return [
-        normalize_feed_listing(raw_item, default_source_name=default_source_name)
-        for raw_item in raw_items
-    ]
+    normalized_items: list[dict[str, Any]] = []
+    for raw_item in raw_items:
+        detected_origin = resolve_data_origin(
+            raw_item,
+            default_source_name=default_source_name,
+        )
+        normalized_items.append(
+            normalize_feed_listing(
+                {
+                    **raw_item,
+                    # Any local file import must stay visibly non-live unless
+                    # an upstream connector already tagged the item explicitly.
+                    "data_origin": raw_item.get("data_origin")
+                    or (
+                        detected_origin
+                        if detected_origin != "unknown"
+                        else "file_feed"
+                    ),
+                },
+                default_source_name=default_source_name,
+            )
+        )
+    return normalized_items
 
 
 def _load_jsonl(content: str) -> list[dict[str, Any]]:

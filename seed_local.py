@@ -28,6 +28,7 @@ def main() -> None:
             "is_copro": 0,
             "is_new_build": 0,
             "is_live_data": 1,
+            "data_origin": "seed",
             "is_active": 1,
             "notes": "Seed local minimal",
             "updated_at": utcnow_iso(),

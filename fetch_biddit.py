@@ -1,27 +1,24 @@
-﻿import argparse
+import argparse
 from pathlib import Path
 
 from config import load_config
-from sources.immoweb_browser_source import (
-    DEFAULT_SESSION_STATE_PATH,
-    collect_immoweb_browser_listings,
+from sources.common import write_listings_jsonl
+from sources.biddit_browser_source import (
+    collect_biddit_browser_listing_result,
+    format_biddit_browser_coverage_summary,
 )
-from sources.immoweb_source import (
-    ImmowebFetchError,
-    collect_immoweb_listings,
-    write_listings_jsonl,
-)
+from sources.biddit_source import BidditFetchError, collect_biddit_listings
 from storage import build_storage
 
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Collecte des annonces Immoweb et les convertit vers le format interne."
+        description="Collecte des annonces Biddit et les convertit vers le format interne."
     )
     parser.add_argument(
         "--search-url",
-        help="URL de recherche Immoweb a collecter",
+        help="URL de recherche Biddit a collecter",
     )
     parser.add_argument(
         "--html-file",
@@ -29,7 +26,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--output",
-        default=str(Path("sample_data") / "immoweb_latest.jsonl"),
+        default=str(Path("sample_data") / "biddit_latest.jsonl"),
         help="Fichier de sortie JSONL",
     )
     parser.add_argument(
@@ -67,72 +64,53 @@ def main() -> None:
     )
     parser.add_argument(
         "--debug-dir",
-        default=str(Path("debug") / "immoweb"),
+        default=str(Path("debug") / "biddit"),
         help="Dossier de sortie des artefacts de debug Playwright",
     )
     parser.add_argument(
-        "--session-state",
-        default=str(DEFAULT_SESSION_STATE_PATH),
-        help="Fichier JSON Playwright storage state pour sauvegarder ou rejouer une session Immoweb",
-    )
-    parser.add_argument(
-        "--save-session",
-        action="store_true",
-        help="Ouvre une session headed, attend une validation humaine, puis sauvegarde le storage state",
-    )
-    parser.add_argument(
-        "--reuse-session",
-        action="store_true",
-        help="Recharge un storage state Playwright existant avant la collecte live",
+        "--max-pages",
+        type=int,
+        default=4,
+        help="Nombre maximum de pages de resultats Biddit a parcourir en mode navigateur",
     )
     args = parser.parse_args()
 
     if not args.html_file and not args.search_url:
         raise SystemExit("Fournis --html-file ou --search-url.")
-    if args.html_file and (args.save_session or args.reuse_session):
-        raise SystemExit("Les options de session Playwright s'utilisent uniquement avec --search-url.")
-    if args.http and (args.save_session or args.reuse_session):
-        raise SystemExit("Les options de session Playwright ne s'appliquent pas au mode --http.")
-    if args.save_session and not args.search_url:
-        raise SystemExit("--save-session requiert --search-url.")
-    if args.save_session and not args.headed:
-        raise SystemExit("--save-session requiert aussi --headed pour permettre une validation humaine.")
 
-    session_state_path = (
-        args.session_state if (args.save_session or args.reuse_session) else None
-    )
-
+    browser_collection_result = None
     try:
         if args.html_file:
-            items = collect_immoweb_listings(html_file=args.html_file)
+            items = collect_biddit_listings(html_file=args.html_file)
             collection_mode = "fixture"
         elif args.http:
-            items = collect_immoweb_listings(search_url=args.search_url)
+            items = collect_biddit_listings(
+                search_url=args.search_url,
+                timeout=max(1, args.timeout_ms // 1000),
+            )
             collection_mode = "http"
+            browser_collection_result = None
         else:
-            items = collect_immoweb_browser_listings(
+            browser_collection_result = collect_biddit_browser_listing_result(
                 args.search_url,
                 timeout_ms=args.timeout_ms,
                 headless=not args.headed,
                 debug_save_html=args.debug_save_html,
                 debug_screenshot=args.debug_screenshot,
                 debug_dir=args.debug_dir,
-                session_state_path=session_state_path,
-                save_session=args.save_session,
-                reuse_session=args.reuse_session,
+                max_pages=max(1, args.max_pages),
             )
+            items = browser_collection_result.items
             collection_mode = "browser"
-    except ImmowebFetchError as exc:
-        raise SystemExit(f"Collecte Immoweb impossible: {exc}") from exc
+    except BidditFetchError as exc:
+        raise SystemExit(f"Collecte Biddit impossible: {exc}") from exc
 
     output_path = write_listings_jsonl(args.output, items)
 
-    print(f"Collecte Immoweb ({collection_mode}): {len(items)} annonces")
+    print(f"Collecte Biddit ({collection_mode}): {len(items)} annonces")
+    if collection_mode == "browser" and browser_collection_result is not None:
+        print(format_biddit_browser_coverage_summary(browser_collection_result))
     print(f"Fichier genere: {output_path}")
-    if args.reuse_session and session_state_path:
-        print(f"Session Playwright reutilisee: {session_state_path}")
-    if args.save_session and session_state_path:
-        print(f"Session Playwright sauvegardee: {session_state_path}")
 
     if args.ingest:
         config = load_config()

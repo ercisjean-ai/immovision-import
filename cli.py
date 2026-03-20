@@ -6,7 +6,14 @@ from storage import build_storage
 def main() -> None:
     config = load_config()
     storage = build_storage(config)
-    stats = {"discovered_count": 0, "queued": 0, "imported": 0}
+    stats = {
+        "discovered_count": 0,
+        "queued": 0,
+        "imported": 0,
+        "new": 0,
+        "seen": 0,
+        "modified": 0,
+    }
 
     print(f"Backend actif: {config.backend_name}")
     if config.sqlite_path:
@@ -22,6 +29,9 @@ def main() -> None:
         print(
             f"Decouverte: {stats['discovered_count']} URLs, "
             f"import: {stats['imported']} annonces, "
+            f"new: {stats['new']}, "
+            f"seen: {stats['seen']}, "
+            f"modified: {stats['modified']}, "
             f"nouvelles URLs envoyees en file: {stats['queued']}."
         )
     except Exception as exc:

@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Luko R6 Immo</title>
+    <link rel="stylesheet" href="/static/styles.css">
+  </head>
+  <body>
+    <div class="shell">
+      <header class="hero">
+        <div class="hero-copy">
+          <p class="eyebrow">Moteur Investisseur / Donnees Reelles</p>
+          <h1 class="hero-title">
+            <span class="hero-title-mark">Luko R6</span>
+            <span class="hero-title-word">Immo</span>
+          </h1>
+          <p class="hero-subtitle">Radar premium des opportunites brutes, scorees et historisees.</p>
+          <p class="hero-text">
+            Priorisation reelle selon la strategie investisseur : prix par unite, unites existantes,
+            copropriete, zone cible, source et stabilite d'observation.
+          </p>
+        </div>
+        <div class="hero-meta" id="hero-meta">
+          <div class="meta-card">
+            <span class="meta-label">Base</span>
+            <span class="meta-value" id="database-path">-</span>
+          </div>
+          <div class="meta-card">
+            <span class="meta-label">Derniere lecture</span>
+            <span class="meta-value" id="generated-at">-</span>
+          </div>
+          <div class="meta-card filter-card">
+            <span class="meta-label">Affichage</span>
+            <label class="toggle-row" for="live-only-toggle">
+              <input id="live-only-toggle" type="checkbox" checked>
+              <span class="toggle-ui" aria-hidden="true"></span>
+              <span class="toggle-copy">
+                <strong>Vue investisseur stricte</strong>
+                <small>Affiche uniquement le live avec lien source fiable.</small>
+              </span>
+            </label>
+            <p class="meta-hint" id="data-mode-hint">La vue principale affiche uniquement les annonces live au lien source valide.</p>
+          </div>
+        </div>
+      </header>
+
+      <main class="layout">
+        <section class="control-panel">
+          <div class="control-grid">
+            <label class="control control-search">
+              <span class="control-label">Recherche</span>
+              <input id="search-input" type="search" placeholder="Titre, commune, CP, source, raison...">
+            </label>
+
+            <label class="control">
+              <span class="control-label">Source</span>
+              <select id="source-filter">
+                <option value="all">Toutes</option>
+              </select>
+            </label>
+
+            <label class="control">
+              <span class="control-label">Strategie</span>
+              <select id="strategy-filter">
+                <option value="all">Toutes</option>
+              </select>
+            </label>
+
+            <label class="control">
+              <span class="control-label">Observation</span>
+              <select id="observation-filter">
+                <option value="all">Toutes</option>
+              </select>
+            </label>
+
+            <label class="control">
+              <span class="control-label">Zone</span>
+              <select id="zone-filter">
+                <option value="all">Toutes</option>
+              </select>
+            </label>
+
+            <label class="control">
+              <span class="control-label">Tri</span>
+              <select id="sort-select">
+                <option value="priority">Priorite investisseur</option>
+                <option value="newest">Fraicheur (plus recentes)</option>
+                <option value="investment_desc">Score investissement</option>
+                <option value="confidence_desc">Score confiance</option>
+                <option value="price_asc">Prix total (croissant)</option>
+                <option value="ppu_asc">Prix / unite (croissant)</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="control-footer">
+            <div class="result-stats">
+              <strong id="visible-count">0 annonce live affichee</strong>
+              <span id="priority-count">0 exclue car non live</span>
+              <span id="result-scope">0 exclue car lien invalide.</span>
+            </div>
+            <button id="reset-filters" type="button" class="reset-button">Reinitialiser</button>
+          </div>
+        </section>
+
+        <section class="priority-panel" id="priority-panel" hidden></section>
+        <section class="secondary-review-panel" id="secondary-review-panel" hidden></section>
+        <section class="summary-grid" id="summary-grid"></section>
+        <section class="sections" id="sections"></section>
+      </main>
+    </div>
+
+    <template id="summary-card-template">
+      <article class="summary-card">
+        <span class="summary-label"></span>
+        <strong class="summary-value"></strong>
+      </article>
+    </template>
+
+    <template id="section-template">
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <h2 class="panel-title"></h2>
+            <p class="panel-subtitle"></p>
+          </div>
+          <span class="panel-count"></span>
+        </div>
+        <div class="listing-grid"></div>
+        <p class="empty-state">Aucune annonce dans cette vue.</p>
+      </section>
+    </template>
+
+    <template id="listing-card-template">
+      <article class="listing-card">
+        <div class="listing-top">
+          <div class="listing-badges">
+            <span class="badge priority-badge"></span>
+            <span class="badge source-badge"></span>
+            <span class="badge origin-badge"></span>
+            <span class="badge link-badge"></span>
+            <span class="badge strategy-badge"></span>
+            <span class="badge observation-badge"></span>
+          </div>
+          <a class="open-link" target="_blank" rel="noreferrer">Ouvrir l'annonce</a>
+        </div>
+        <h3 class="listing-title"></h3>
+        <p class="listing-location"></p>
+        <dl class="metrics">
+          <div><dt>Prix total</dt><dd class="metric-price"></dd></div>
+          <div><dt>Unites</dt><dd class="metric-units"></dd></div>
+          <div><dt>Prix / unite</dt><dd class="metric-ppu"></dd></div>
+          <div><dt>Score inv.</dt><dd class="metric-investment"></dd></div>
+          <div><dt>Confiance</dt><dd class="metric-confidence"></dd></div>
+          <div><dt>Vu</dt><dd class="metric-last-seen"></dd></div>
+        </dl>
+        <p class="listing-reason"></p>
+      </article>
+    </template>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

@@ -3,7 +3,12 @@
     calculate_confidence_score,
     calculate_investment_score,
 )
-from config import RuntimeConfig, load_config
+from config import (
+    DEFAULT_SQLITE_FILENAME,
+    PROJECT_ROOT,
+    RuntimeConfig,
+    load_config,
+)
 from normalization import build_listing_payload
 from parsing import extract_immoweb_listing_candidates
 from sqlite_storage import SQLiteStorage
@@ -25,24 +30,30 @@ def test_build_analysis_keeps_current_formula():
     assert analysis["estimated_total_rent_monthly"] == 1700
     assert analysis["estimated_monthly_loan_payment"] == 1386.25
     assert analysis["estimated_gross_yield"] == 8.16
-    assert analysis["investment_score"] == 62
+    assert analysis["investment_score"] == 65
     assert analysis["investment_score_label"] == "Moyen"
+    assert analysis["strategy_label"] == "A analyser"
     assert analysis["confidence_score"] == 60
     assert analysis["confidence_label"] == "Correcte"
-    assert analysis["compatibility_reason"].startswith("Cas test | score 62/100 [Moyen] |")
-    assert "rendement:28/35" in analysis["compatibility_reason"]
-    assert "prix_unite:16/20" in analysis["compatibility_reason"]
+    assert analysis["compatibility_reason"].startswith("Cas test | score 65/100 [Moyen] |")
+    assert "rendement:6/8" in analysis["compatibility_reason"]
+    assert "prix_unite:24/28" in analysis["compatibility_reason"]
+    assert "copro:6/15" in analysis["compatibility_reason"]
+    assert "strategie:A analyser" in analysis["compatibility_reason"]
+    assert "copropriete inconnue" in analysis["compatibility_reason"]
 
 
 
 def test_calculate_investment_score_is_transparent():
     score, label, explanation, compatible = calculate_investment_score(
         {
+            "source_name": "Immoweb",
             "commune": "Ixelles",
             "postal_code": "1050",
             "existing_units": 3,
             "surface": 240,
             "property_type": "apartment_block",
+            "is_copro": False,
             "transaction_type": "sale",
         },
         gross_yield=10.36,
@@ -53,8 +64,79 @@ def test_calculate_investment_score_is_transparent():
     assert label == "Interessant"
     assert compatible is True
     assert "score 98/100 [Interessant]" in explanation
-    assert "rendement:35/35" in explanation
-    assert "localisation:5/5" in explanation
+    assert "rendement:8/8" in explanation
+    assert "copro:15/15" in explanation
+    assert "localisation:10/10" in explanation
+
+
+
+def test_build_analysis_marks_hors_criteres_when_strategy_blockers_exist():
+    analysis = build_analysis(
+        {
+            "listing_id": "99",
+            "source_name": "Immoweb",
+            "title": "Maison de commerce a revoir",
+            "price": 410000,
+            "commune": "Vilvoorde",
+            "postal_code": "1800",
+            "existing_units": 1,
+            "is_copro": True,
+            "transaction_type": "sale",
+        }
+    )
+
+    assert analysis["price_per_unit"] == 410000.0
+    assert analysis["strategy_label"] == "Hors criteres"
+    assert analysis["strategy_compatible"] is False
+    assert "moins de 2 unites" in analysis["compatibility_reason"]
+    assert "copropriete" in analysis["compatibility_reason"]
+
+
+
+def test_build_analysis_prioritizes_commercial_house_in_target_zone():
+    analysis = build_analysis(
+        {
+            "listing_id": "100",
+            "source_name": "Immoweb",
+            "title": "Maison de commerce avec logements",
+            "description": "Maison de commerce avec 3 unites a Vilvoorde",
+            "price": 420000,
+            "commune": "Vilvoorde",
+            "postal_code": "1800",
+            "existing_units": 3,
+            "surface": 260,
+            "is_copro": False,
+            "transaction_type": "sale",
+        }
+    )
+
+    assert analysis["price_per_unit"] == 140000.0
+    assert analysis["strategy_label"] == "Compatible"
+    assert analysis["strategy_compatible"] is True
+    assert analysis["zone_label"] == "Peripherie cible"
+    assert "type prioritaire" in analysis["compatibility_reason"]
+
+
+def test_unknown_copro_never_reaches_full_compatible_strategy():
+    analysis = build_analysis(
+        {
+            "listing_id": "101",
+            "source_name": "Immoweb",
+            "title": "Immeuble de rapport",
+            "price": 360000,
+            "commune": "Ixelles",
+            "postal_code": "1050",
+            "property_type": "apartment_block",
+            "existing_units": 3,
+            "surface": 255,
+            "transaction_type": "sale",
+        }
+    )
+
+    assert analysis["investment_score"] == 87
+    assert analysis["strategy_label"] == "A analyser"
+    assert analysis["strategy_compatible"] is False
+    assert "copropriete inconnue" in analysis["compatibility_reason"]
 
 
 
@@ -106,6 +188,7 @@ def test_extract_immoweb_listing_candidates_deduplicates_urls():
 def test_build_listing_payload_keeps_default_transaction_type():
     payload = build_listing_payload(
         {
+            "source_name": "Immoweb",
             "source_listing_id": "12345678",
             "source_url": "https://example.test/12345678",
         },
@@ -113,8 +196,10 @@ def test_build_listing_payload_keeps_default_transaction_type():
     )
 
     assert payload["source_id"] == "1"
+    assert payload["source_name"] == "Immoweb"
     assert payload["source_listing_id"] == "12345678"
     assert payload["transaction_type"] == "sale"
+    assert payload["copro_status"] == "unknown"
 
 
 
@@ -129,6 +214,19 @@ def test_load_config_defaults_to_sqlite(monkeypatch, tmp_path):
     assert isinstance(config, RuntimeConfig)
     assert config.backend_name == "sqlite"
     assert config.sqlite_path == (tmp_path / "local.db").resolve()
+
+
+def test_load_config_defaults_to_repo_sqlite_path(monkeypatch):
+    monkeypatch.delenv("SUPABASE_URL", raising=False)
+    monkeypatch.delenv("SUPABASE_KEY", raising=False)
+    monkeypatch.delenv("SUPABASE_ANON_KEY", raising=False)
+    monkeypatch.delenv("SQLITE_PATH", raising=False)
+
+    config = load_config()
+
+    assert isinstance(config, RuntimeConfig)
+    assert config.backend_name == "sqlite"
+    assert config.sqlite_path == (PROJECT_ROOT / DEFAULT_SQLITE_FILENAME).resolve()
 
 
 
